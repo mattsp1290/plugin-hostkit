@@ -93,7 +93,7 @@ def rust_kind(value):
     assert value in ("i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "f32", "f64"), value
     return value[0] + str(int(value[1:]) // 8)
 
-for path in sorted((ROOT / "src").glob("*.rs")):
+for path in sorted((ROOT / "src").rglob("*.rs")):
     original = path.read_text()
     text = strip_comments(original)
     for match in re.finditer(r"\[\s*((?:0x[\da-fA-F]{2}\s*,?\s*){16})\]", text):

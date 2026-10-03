@@ -6,8 +6,8 @@ Audit date: 2026-10-03. Scope: plugin-hostkit H1–H6 only.
 Source snapshot: author's `multisamples` repository at
 `a2207788282cf943d9d12cfeab63b4897af808b2`.
 Decision owner: Matt Spurlin. Local L1–L5 checks passed as recorded below.
-The first imported-code push still requires the owner's review and approval
-of this document. Remote CI and tag evidence are recorded in the H6 Beans issue.
+The owner approved this audited public push on 2026-10-03 before the first
+publication of imported code (reply: “Approve the audited public push”). Remote CI and tag evidence are recorded in the H6 Beans issue.
 
 ## L1 — SDK reference and ABI
 
@@ -424,10 +424,63 @@ SDK verification. The native ownership probe passed all three cleanup paths;
 a process-wide leaks run additionally reported system AppIntents XPC cycles,
 so it is not claimed as a whole-process leak-free result.
 
+## Structural review corrections
+
+The second review used the complete Cursor rubric pinned at
+`9511e60321f7e533a187d62854a3d53a53752874` after the standard-review
+commit was pushed. Its three Important findings were addressed:
+
+- COM object implementations, SDK ABI declarations, diagnostics and Linux
+  callback servicing now have focused private modules. Editor frame, creation,
+  Cocoa input, dispatch and native window ownership are separate. Instance
+  loading, buses, processing, state, controller and activation have dedicated
+  implementation modules. Every Rust source is below 1,000 lines.
+- Native editor configuration uses one shared routine, retaining platform
+  dispatch and macOS DPI handling at their respective boundaries.
+- Five obsolete signal-recovery forwarding wrappers were deleted. Foreign
+  calls remain process-fatal, and exact native ownership/teardown bodies were
+  preserved during decomposition.
+
+These new files only reorganize the already allowlisted source and review
+fixes; no additional source repository files, SDK implementation or product
+resources were imported:
+
+```text
+src/com/abi.rs
+src/com/connection.rs
+src/com/diagnostics.rs
+src/com/host.rs
+src/com/host/run_loop.rs
+src/com/message.rs
+src/com/processing.rs
+src/com/stream.rs
+src/editor/abi.rs
+src/editor/cocoa.rs
+src/editor/cocoa/callbacks.rs
+src/editor/cocoa/dispatch.rs
+src/editor/create.rs
+src/editor/frame.rs
+src/editor/x11.rs
+src/instance/activation.rs
+src/instance/buses.rs
+src/instance/controller.rs
+src/instance/lifecycle.rs
+src/instance/native.rs
+src/instance/processing.rs
+src/instance/state.rs
+```
+
+The ABI verifier now discovers nested Rust sources. Both local platform gates
+passed after the refactor, including strict Clippy, SDK signature/layout
+verification with unchanged counts, the required Linux SDK audio fixture,
+macOS installed-plugin suites, warning-free rustdoc and package inspection.
+The package contains 63 intended entries, including Cargo-generated metadata.
+
 ## Committed path-history verification
 
 `git log --all --name-only --format=` passed the prohibited-path check after
-the local implementation commit. Its unique nonempty output paths are:
+the local implementation commit. The initial unique nonempty output paths
+are below; the structural-review source paths listed above extend this set:
 
 ```text
 .github/workflows/ci.yml

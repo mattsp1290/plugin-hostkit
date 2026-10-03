@@ -8,7 +8,7 @@ repository = "https://github.com/mattsp1290/plugin-hostkit"
 description = "Plugin discovery, isolated metadata scanning, and native hosting"
 
 [dependencies]
-dirs = "=6.0.0"
+dirs = { package = "dirs-next", version = "=2.0.0" }
 libc = "=0.2.183"
 libloading = "=0.8.9"
 serde_json = "=1.0.149"
@@ -18,3 +18,19 @@ tracing = "=0.1.44"
 [dev-dependencies]
 tempfile = "=3.27.0"
 tracing-subscriber = "=0.3.23"
+
+[[bin]]
+name = "plugin-scanner"
+path = "src/bin/plugin_scanner.rs"
+
+[[test]]
+name = "vital_editor_tests"
+harness = false
+
+[[test]]
+name = "deadlock_editor_tests"
+harness = false
+
+[[test]]
+name = "sigsegv_guard_tests"
+harness = false

@@ -61,7 +61,9 @@ fn service_editor_startup() {
 
 fn test_editor_view_created(instance: &VstInstance) -> bool {
     eprintln!("test: vital_editor_view_created_from_instance");
-    let view = match EditorView::from_instance(instance) {
+    // SAFETY: the harness keeps this initialized instance alive until view teardown,
+    // and runs native operations on the process main thread.
+    let view = match unsafe { EditorView::from_instance(instance) } {
         Ok(v) => v,
         Err(e) => {
             eprintln!("FAIL: EditorView not available for installed Vital: {e}");
@@ -82,7 +84,9 @@ fn test_editor_view_created(instance: &VstInstance) -> bool {
 
 fn test_editor_open_and_close(instance: &VstInstance) -> bool {
     eprintln!("test: vital_editor_open_and_close");
-    let mut view = match EditorView::from_instance(instance) {
+    // SAFETY: the harness keeps this initialized instance alive until view teardown,
+    // and runs native operations on the process main thread.
+    let mut view = match unsafe { EditorView::from_instance(instance) } {
         Ok(v) => v,
         Err(e) => {
             eprintln!("FAIL: EditorView not available for installed Vital: {e}");
@@ -102,7 +106,9 @@ fn test_editor_open_and_close(instance: &VstInstance) -> bool {
 
 fn test_editor_close_is_idempotent(instance: &VstInstance) -> bool {
     eprintln!("test: vital_editor_close_is_idempotent");
-    let mut view = match EditorView::from_instance(instance) {
+    // SAFETY: the harness keeps this initialized instance alive until view teardown,
+    // and runs native operations on the process main thread.
+    let mut view = match unsafe { EditorView::from_instance(instance) } {
         Ok(v) => v,
         Err(e) => {
             eprintln!("FAIL: EditorView not available for installed Vital: {e}");
@@ -123,7 +129,9 @@ fn test_editor_close_is_idempotent(instance: &VstInstance) -> bool {
 
 fn test_editor_drop_closes_cleanly(instance: &VstInstance) -> bool {
     eprintln!("test: vital_editor_drop_closes_cleanly");
-    let mut view = match EditorView::from_instance(instance) {
+    // SAFETY: the harness keeps this initialized instance alive until view teardown,
+    // and runs native operations on the process main thread.
+    let mut view = match unsafe { EditorView::from_instance(instance) } {
         Ok(v) => v,
         Err(e) => {
             eprintln!("FAIL: EditorView not available for installed Vital: {e}");

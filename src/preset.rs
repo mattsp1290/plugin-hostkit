@@ -153,9 +153,11 @@ fn scan_vstpreset_recursive(
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             scan_vstpreset_recursive(&path, base_dir, presets, index);
-        } else if path.extension().is_some_and(|ext| ext == "vstpreset") {
+        } else if entry.file_type().is_ok_and(|kind| kind.is_file())
+            && path.extension().is_some_and(|ext| ext == "vstpreset")
+        {
             let name = path
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -257,9 +259,11 @@ fn count_files_recursive(dir: &Path, ext: &str) -> usize {
     let mut count = 0;
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             count += count_files_recursive(&path, ext);
-        } else if path.extension().is_some_and(|e| e == ext) {
+        } else if entry.file_type().is_ok_and(|kind| kind.is_file())
+            && path.extension().is_some_and(|e| e == ext)
+        {
             count += 1;
         }
     }
@@ -280,6 +284,33 @@ pub fn count_preset_files(plugin_id: &str, plugin_name: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn traversal_discovers_names_categories_and_ignores_other_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let nested = temp.path().join("Bass");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(temp.path().join("Lead.vstpreset"), b"fixture").unwrap();
+        std::fs::write(nested.join("Deep.vstpreset"), b"fixture").unwrap();
+        std::fs::write(nested.join("ignore.txt"), b"fixture").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(temp.path(), nested.join("cycle")).unwrap();
+            std::os::unix::fs::symlink(&nested, temp.path().join("Alias")).unwrap();
+        }
+        let mut presets = Vec::new();
+        let mut index = 0;
+        scan_vstpreset_recursive(temp.path(), temp.path(), &mut presets, &mut index);
+        presets.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(
+            presets.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["Deep", "Lead"]
+        );
+        assert_eq!(presets[0].category, "Bass");
+        assert_eq!(index, 2);
+        assert_ne!(presets[0].index, presets[1].index);
+        assert_eq!(count_files_recursive(temp.path(), "vstpreset"), 2);
+    }
 
     #[test]
     fn parse_minimal_preset() {

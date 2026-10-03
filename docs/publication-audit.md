@@ -384,6 +384,46 @@ pull requests and manual dispatch, including release tags. CI is still a
 publication checkpoint to verify on the exact release commit; local container
 evidence is not described as remote CI success.
 
+## Standard review safety corrections
+
+Owner approval of this completed audit and the public push was recorded on
+2026-10-03 before any imported-code publication. The standard dual review found
+host-owned defects that were corrected locally before that push:
+
+- Callback ring readers/writers now use bounded nonblocking slot locks; Linux
+  run-loop snapshots own COM handler references through reentrant unregistration.
+  Registrations are cleared before module teardown.
+- Rust setjmp/process-wide signal recovery was removed: native faults are
+  process-fatal and isolation belongs in disposable children. This corrects an
+  undersized Linux ABI declaration, cross-thread jump risk and compiler
+  returns-twice assumptions without changing any SDK interface layout.
+- `EditorView::from_instance` is now unsafe with an owner/state/UI-thread
+  contract and runtime state checks. Mutable audio processing remains possible;
+  callers must drop the editor before terminating its instance.
+- Cocoa allocation ownership is balanced for window, view and delegate, with
+  RAII cleanup on construction failure and deferred cleanup during user close.
+  A local instrumented copy of the exact implementation used Objective-C weak
+  references to confirm deallocation after normal close, user close and an injected
+  partial-construction failure. The generic
+  main-thread helper rejects unavailable worker dispatch instead of running
+  AppKit work on a worker. Its availability query uses CoreFoundation's
+  [current-mode API](https://developer.apple.com/documentation/corefoundation/cfrunloopcopycurrentmode%28_%3A%29).
+- Connection cleanup retains exact queried peers, disconnects direct fallbacks
+  and rolls back partially successful connections. Standard metadata arrays,
+  bounded scanner output capture and cyclic directory handling were corrected.
+  Regressions exercise these paths; preset discovery coverage calls its actual
+  production walker.
+
+After these corrections, local macOS and Linux gates passed again: 42 unit tests
+on each platform, 14 synthetic discovery/preset cases, two scanner CLI/options
+cases and one compile doctest (59 non-plugin cases). macOS also executed the
+12 installed Vital/Addictive Drums cases listed above. Linux executed the
+mandatory SDK lifecycle/audio test separately with no skipped cases. The same
+36 IID occurrences, 32 vtables, 233 method signatures and 90 POD fields pass
+SDK verification. The native ownership probe passed all three cleanup paths;
+a process-wide leaks run additionally reported system AppIntents XPC cycles,
+so it is not claimed as a whole-process leak-free result.
+
 ## Committed path-history verification
 
 `git log --all --name-only --format=` passed the prohibited-path check after

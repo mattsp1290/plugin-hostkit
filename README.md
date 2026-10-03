@@ -58,9 +58,11 @@ Plugins process audio in your process and can crash, hang, or corrupt memory.
 Metadata scanning uses a disposable helper with a timeout and persistent blacklist.
 For render isolation, use a child process; see
 [plugin-render-bridge](https://github.com/mattsp1290/plugin-render-bridge).
-The inherited signal recovery code is best-effort diagnostics and cannot make
-foreign code safe. Editor views require their instance to stay alive and must
-be closed before terminating it. Allow asynchronous GUI startup to run before
+Native faults terminate the process; the host does not jump through Rust or
+foreign frames to recover. `EditorView::from_instance` is unsafe: its instance
+must stay alive and initialized until the editor is closed and dropped. Serialize
+native UI operations on the main thread and keep its event loop serviced during
+worker dispatch and native-owner cleanup. Allow asynchronous GUI startup to run before
 closing a view, with the normal application event loop.
 
 The current bus setup is instrument-oriented and accepts Float32 processing. Use

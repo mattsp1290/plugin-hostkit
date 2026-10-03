@@ -14,6 +14,8 @@ fn fixture_lifecycle_produces_audio() {
     let bundle = Vst3Bundle::from_path(std::path::Path::new(&path)).expect("fixture bundle");
     let mut instance =
         VstInstance::load(&bundle.binary_path.expect("fixture binary")).expect("load");
+    // Rejection happens before native editor calls or owner-pointer use.
+    assert!(unsafe { plugin_hostkit::EditorView::from_instance(&instance) }.is_err());
     eprintln!("fixture: initialize");
     instance.initialize().expect("initialize");
     eprintln!("fixture: setup_processing");
@@ -53,5 +55,6 @@ fn fixture_lifecycle_produces_audio() {
     instance.deactivate().expect("deactivate");
     eprintln!("fixture: terminate");
     instance.terminate().expect("terminate");
+    assert!(unsafe { plugin_hostkit::EditorView::from_instance(&instance) }.is_err());
     assert!(audible, "note-on must produce non-silent audio");
 }

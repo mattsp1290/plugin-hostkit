@@ -1,15 +1,3 @@
-#[cfg(unix)]
-unsafe fn signal_fault_address(info: *const libc::siginfo_t) -> *mut std::ffi::c_void {
-    #[cfg(target_os = "macos")]
-    unsafe {
-        (*info).si_addr
-    }
-    #[cfg(not(target_os = "macos"))]
-    unsafe {
-        (*info).si_addr()
-    }
-}
-
 use std::os::raw::c_void;
 use std::path::Path;
 
@@ -105,6 +93,8 @@ pub struct VstInstance {
     controller_is_separate: bool,
     // IConnectionPoint proxies (only for separate controllers).
     // Stored here so they're released on terminate. Null when not used.
+    cp_comp: *mut c_void, // owned queried connection point while connected
+    cp_ctrl: *mut c_void,
     cp_proxy_comp: *mut c_void, // proxy that component connects to (forwards to ctrl)
     cp_proxy_ctrl: *mut c_void, // proxy that controller connects to (forwards to comp)
     /// Initial parameter changes to inject into the first process() call.
@@ -179,10 +169,9 @@ impl VstInstance {
 
         // Create component and audio processor instances via the plugin factory.
         // Also calls bundleEntry to initialize plugin-global resources (GUI, etc.).
-        // Guarded: SIGSEGV during bundleEntry/createInstance is caught and returned
-        // as an error instead of killing the process.
+        // Native faults are process-fatal; isolate probes in a child process.
         let (component, processor, factory) =
-            unsafe { guarded_create_instance(&library, library_path, &name, bundle_ref)? };
+            unsafe { call_create_instance(&library, library_path, &name, bundle_ref)? };
 
         // SAFETY: COM objects begin with a pointer to their vtable. The double
         // dereference extracts the vtable pointer from the COM object pointer.
@@ -210,6 +199,8 @@ impl VstInstance {
             factory_vtbl,
             controller: std::ptr::null_mut(),
             controller_is_separate: false,
+            cp_comp: std::ptr::null_mut(),
+            cp_ctrl: std::ptr::null_mut(),
             cp_proxy_comp: std::ptr::null_mut(),
             cp_proxy_ctrl: std::ptr::null_mut(),
             initial_params: None,
@@ -259,11 +250,9 @@ impl VstInstance {
         // IComponentHandler. Some plugins pass this pointer internally via
         // IConnectionPoint and cast it without QI.
         let host_ctx_ptr = self.host_context.handler_ptr();
-        // Guarded: SIGSEGV during IComponent::initialize is caught and returned
-        // as an error. Only wraps this vtable call, not init_edit_controller
-        // (which has its own guarded_set_component_state guard).
+        // Native faults are process-fatal; isolate probes in a child process.
         let result = unsafe {
-            guarded_initialize_component(
+            call_initialize_component(
                 self.component,
                 self.component_vtbl,
                 host_ctx_ptr,
@@ -691,11 +680,15 @@ impl VstInstance {
             processor_vtbl: *const IAudioProcessorVtbl,
             controller: *mut c_void,
             controller_is_separate: bool,
+            cp_comp: *mut c_void,
+            cp_ctrl: *mut c_void,
             cp_proxy_comp: *mut c_void,
             cp_proxy_ctrl: *mut c_void,
             factory: *mut c_void,
             factory_vtbl: *const IPluginFactoryVtbl,
             library: *const libloading::Library,
+            #[cfg(target_os = "linux")]
+            host_context: *const HostContextObj,
             bus_info: BusInfo,
             name: String,
         }
@@ -714,11 +707,15 @@ impl VstInstance {
             processor_vtbl: self.processor_vtbl,
             controller: self.controller,
             controller_is_separate: self.controller_is_separate,
+            cp_comp: self.cp_comp,
+            cp_ctrl: self.cp_ctrl,
             cp_proxy_comp: self.cp_proxy_comp,
             cp_proxy_ctrl: self.cp_proxy_ctrl,
             factory: self.factory,
             factory_vtbl: self.factory_vtbl,
             library: &self._library as *const libloading::Library,
+            #[cfg(target_os = "linux")]
+            host_context: &*self.host_context,
             bus_info: self.bus_info.clone(),
             name: self.name.clone(),
         };
@@ -762,29 +759,23 @@ impl VstInstance {
                     // Disconnect IConnectionPoint proxies (only for separate controllers —
                     // unified controllers were never connected)
                     if ctx.controller_is_separate {
-                        let mut comp_cp: *mut c_void = std::ptr::null_mut();
-                        let mut ctrl_cp: *mut c_void = std::ptr::null_mut();
-                        if !ctx.component.is_null() {
-                            let _ = ((*ctx.component_vtbl).query_interface)(
-                                ctx.component,
-                                &IID_ICONNECTION_POINT,
-                                &mut comp_cp,
-                            );
-                        }
-                        let _ = ((*ctrl_vtbl).query_interface)(
-                            ctx.controller,
-                            &IID_ICONNECTION_POINT,
-                            &mut ctrl_cp,
-                        );
-
-                        // Disconnect the plugin CPs from our proxies.
-                        if !comp_cp.is_null() && !ctx.cp_proxy_comp.is_null() {
-                            let comp_cp_vtbl = *(comp_cp as *const *const IConnectionPointVtbl);
-                            ((*comp_cp_vtbl).disconnect)(comp_cp, ctx.cp_proxy_comp);
-                        }
-                        if !ctrl_cp.is_null() && !ctx.cp_proxy_ctrl.is_null() {
-                            let ctrl_cp_vtbl = *(ctrl_cp as *const *const IConnectionPointVtbl);
-                            ((*ctrl_cp_vtbl).disconnect)(ctrl_cp, ctx.cp_proxy_ctrl);
+                        let comp_cp = ctx.cp_comp;
+                        let ctrl_cp = ctx.cp_ctrl;
+                        if !comp_cp.is_null() && !ctrl_cp.is_null() {
+                            let comp_peer = if ctx.cp_proxy_comp.is_null() {
+                                ctrl_cp
+                            } else {
+                                ctx.cp_proxy_comp
+                            };
+                            let ctrl_peer = if ctx.cp_proxy_ctrl.is_null() {
+                                comp_cp
+                            } else {
+                                ctx.cp_proxy_ctrl
+                            };
+                            let comp_vtbl = *(comp_cp as *const *const IConnectionPointVtbl);
+                            let ctrl_vtbl = *(ctrl_cp as *const *const IConnectionPointVtbl);
+                            ((*comp_vtbl).disconnect)(comp_cp, comp_peer);
+                            ((*ctrl_vtbl).disconnect)(ctrl_cp, ctrl_peer);
                         }
 
                         // Clear proxy targets to prevent dangling notify() calls
@@ -837,6 +828,9 @@ impl VstInstance {
                     ((*ctx.component_vtbl).terminate_component)(ctx.component);
                 }
 
+                #[cfg(target_os = "linux")]
+                (*ctx.host_context).clear_run_loop();
+
                 // Release IAudioProcessor (obtained via queryInterface which did addRef)
                 if !ctx.processor.is_null() {
                     ((*ctx.processor_vtbl).release)(ctx.processor);
@@ -863,6 +857,8 @@ impl VstInstance {
         self.component = std::ptr::null_mut();
         self.processor = std::ptr::null_mut();
         self.controller = std::ptr::null_mut();
+        self.cp_comp = std::ptr::null_mut();
+        self.cp_ctrl = std::ptr::null_mut();
         self.cp_proxy_comp = std::ptr::null_mut();
         self.cp_proxy_ctrl = std::ptr::null_mut();
         self.factory = std::ptr::null_mut();
@@ -1193,11 +1189,10 @@ impl VstInstance {
             let ctrl_vtbl =
                 unsafe { *(self.controller as *const *const IEditControllerVtblHeadless) };
             // SAFETY: controller and ctrl_vtbl are valid (checked above).
-            // Use the SIGSEGV guard — some plugins  crash in
-            // setComponentState. The guard catches the crash and returns -1
-            // instead of killing the process.
+            // Synchronize the controller with component state. Native faults
+            // remain process-fatal, as with all plugin lifecycle calls.
             let ctrl_result = unsafe {
-                guarded_set_component_state(
+                call_set_component_state(
                     self.controller,
                     ctrl_vtbl,
                     ctrl_stream.as_ptr(),
@@ -1217,7 +1212,7 @@ impl VstInstance {
         // Plugins  fire restartComponent(kParamValuesChanged) here,
         // which would cause process() to re-read parameters from the controller.
         // But the controller may have stale/corrupt values if setComponentState
-        // crashed (SIGSEGV guard). Draining the flags prevents process() from
+        // rejected the state. Draining the flags prevents process() from
         // overwriting the correct component state with bad controller values.
         //
         // This unconditional drain is safe for well-behaved plugins too:
@@ -1247,7 +1242,7 @@ impl VstInstance {
     ///
     /// The bytes can be passed back to `set_state()` to restore the plugin's
     /// parameters, or forwarded to a child `vst3-renderer` process via
-    /// `BridgeRenderer::bridge_set_state()`.
+    /// component state followed by controller state synchronization.
     ///
     /// The plugin must be at least Initialized.
     #[tracing::instrument(name = "vst3.get_state", skip_all, fields(plugin = %self.name))]
@@ -1372,6 +1367,20 @@ impl VstInstance {
     /// Bus counts, which are distinct from channel counts.
     pub fn bus_info(&self) -> &BusInfo {
         &self.bus_info
+    }
+
+    pub(crate) fn ensure_editor_ready(&self) -> Result<(), Vst3Error> {
+        if matches!(
+            self.state,
+            InstanceState::Loaded | InstanceState::Terminated
+        ) || self.component.is_null()
+            || self.factory.is_null()
+        {
+            return Err(Vst3Error::InitFailed(
+                "editor requires an initialized, live instance".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn is_active(&self) -> bool {
@@ -1660,14 +1669,14 @@ impl VstInstance {
                     let ctrl_cp_vtbl = *(ctrl_cp as *const *const IConnectionPointVtbl);
 
                     // Step 1: Direct connection
-                    let r1 = ((*comp_cp_vtbl).connect)(comp_cp, ctrl_cp);
-                    let r2 = ((*ctrl_cp_vtbl).connect)(ctrl_cp, comp_cp);
-                    tracing::info!(plugin = %self.name, r1, r2, "IConnectionPoint direct connection");
+                    let direct_ok = connect_pair(comp_cp, comp_cp_vtbl, ctrl_cp, ctrl_cp_vtbl);
+                    tracing::info!(plugin = %self.name, direct_ok, "IConnectionPoint direct connection");
+                    let mut connected = direct_ok;
 
                     // Use only the interface pointers returned by queryInterface.
                     // Product-internal offsets are not part of the public ABI.
 
-                    if r1 == K_RESULT_OK && r2 == K_RESULT_OK {
+                    if direct_ok {
                         // Step 2: Interpose proxies for logging (optional enhancement).
                         // Disconnect direct, create proxies, reconnect through proxies.
                         let proxy_comp =
@@ -1712,25 +1721,29 @@ impl VstInstance {
                             ((*vtbl).release)(proxy_ctrl);
 
                             // Re-establish direct connection
-                            ((*comp_cp_vtbl).connect)(comp_cp, ctrl_cp);
-                            ((*ctrl_cp_vtbl).connect)(ctrl_cp, comp_cp);
+                            connected = connect_pair(comp_cp, comp_cp_vtbl, ctrl_cp, ctrl_cp_vtbl);
                         }
                     } else {
                         // Direct connection failed — plugin may not support IConnectionPoint
                         // notify, or CPs may already be internally connected.
                         tracing::warn!(
-                            plugin = %self.name, r1, r2,
+                            plugin = %self.name,
                             "IConnectionPoint direct connection failed"
                         );
                     }
+                    if connected {
+                        self.cp_comp = comp_cp;
+                        self.cp_ctrl = ctrl_cp;
+                    }
                 }
 
-                // Release the connection point interfaces (the connection persists)
-                if comp_cp_ok {
+                // Keep exact queried interfaces for successful connections;
+                // releasing here would lose the peers needed for disconnect.
+                if comp_cp_ok && self.cp_comp.is_null() {
                     let cp_vtbl = *(comp_cp as *const *const IConnectionPointVtbl);
                     ((*cp_vtbl).release)(comp_cp);
                 }
-                if ctrl_cp_ok {
+                if ctrl_cp_ok && self.cp_ctrl.is_null() {
                     let cp_vtbl = *(ctrl_cp as *const *const IConnectionPointVtbl);
                     ((*cp_vtbl).release)(ctrl_cp);
                 }
@@ -1771,7 +1784,7 @@ impl VstInstance {
                 );
                 stream.reset_position();
                 let scs_result =
-                    guarded_set_component_state(controller, ctrl_vtbl, stream.as_ptr(), &self.name);
+                    call_set_component_state(controller, ctrl_vtbl, stream.as_ptr(), &self.name);
                 scs_result_val = Some(scs_result);
                 if scs_result != K_RESULT_OK {
                     tracing::warn!(
@@ -2202,356 +2215,58 @@ unsafe fn create_instance(
     Ok((component, processor, factory))
 }
 
-// ── SIGSEGV-guarded FFI wrappers ────────────────────────────────────
-//
-// Some plugins crash with SIGSEGV during lifecycle calls (
-// in setComponentState, others during load/initialize). These guards use
-// sigsetjmp/siglongjmp to catch the crash and return an error instead of
-// killing the process. Each guard has its own GUARD_ACTIVE/JUMP_BUF statics
-// to prevent nesting. Lifecycle ordering ensures no two guards overlap:
-//   load() → initialize() [contains setComponentState] → editor open [attached]
-
-/// Call `IEditController::setComponentState` with SIGSEGV recovery.
-///
-/// Returns `K_RESULT_OK` on success, or `-1` if the call crashed.
-unsafe fn guarded_set_component_state(
-    controller: *mut c_void,
-    ctrl_vtbl: *const IEditControllerVtblHeadless,
-    stream: *mut c_void,
-    plugin_name: &str,
-) -> i32 {
-    #[cfg(unix)]
-    {
-        unsafe { guarded_set_component_state_unix(controller, ctrl_vtbl, stream, plugin_name) }
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = plugin_name;
-        unsafe { ((*ctrl_vtbl).set_component_state)(controller, stream) }
+/// Establish both directions or roll back whichever direction succeeded.
+/// All interface pointers must remain valid through rollback.
+unsafe fn connect_pair(
+    comp: *mut c_void,
+    comp_vtbl: *const IConnectionPointVtbl,
+    ctrl: *mut c_void,
+    ctrl_vtbl: *const IConnectionPointVtbl,
+) -> bool {
+    unsafe {
+        let a = ((*comp_vtbl).connect)(comp, ctrl);
+        let b = ((*ctrl_vtbl).connect)(ctrl, comp);
+        tracing::debug!(a, b, "connection pair results");
+        if a == K_RESULT_OK && b == K_RESULT_OK {
+            return true;
+        }
+        if a == K_RESULT_OK {
+            ((*comp_vtbl).disconnect)(comp, ctrl);
+        }
+        if b == K_RESULT_OK {
+            ((*ctrl_vtbl).disconnect)(ctrl, comp);
+        }
+        false
     }
 }
 
-/// Call `create_instance` with SIGSEGV recovery.
-///
-/// Wraps the entire plugin factory interaction (bundleEntry, GetPluginFactory,
-/// createInstance, queryInterface) in a sigsetjmp guard. On crash, returns
-/// `Vst3Error::LoadError` instead of killing the process.
-unsafe fn guarded_create_instance(
+// Foreign faults are process-fatal. Probe untrusted plugins in a child process;
+// signal jumps through Rust and C++ frames cannot provide safe recovery.
+unsafe fn call_set_component_state(
+    controller: *mut c_void,
+    ctrl_vtbl: *const IEditControllerVtblHeadless,
+    stream: *mut c_void,
+    _plugin_name: &str,
+) -> i32 {
+    unsafe { ((*ctrl_vtbl).set_component_state)(controller, stream) }
+}
+
+unsafe fn call_create_instance(
     library: &libloading::Library,
     library_path: &Path,
     name: &str,
     bundle_ref: *mut c_void,
 ) -> Result<(*mut c_void, *mut c_void, *mut c_void), Vst3Error> {
-    #[cfg(unix)]
-    {
-        unsafe { guarded_create_instance_unix(library, library_path, name, bundle_ref) }
-    }
-
-    #[cfg(not(unix))]
-    {
-        unsafe { create_instance(library, library_path, name, bundle_ref) }
-    }
+    unsafe { create_instance(library, library_path, name, bundle_ref) }
 }
 
-#[cfg(unix)]
-unsafe fn guarded_create_instance_unix(
-    library: &libloading::Library,
-    library_path: &Path,
-    name: &str,
-    bundle_ref: *mut c_void,
-) -> Result<(*mut c_void, *mut c_void, *mut c_void), Vst3Error> {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-    #[cfg(target_arch = "aarch64")]
-    const SIGJMP_BUF_LEN: usize = 49;
-    #[cfg(target_arch = "x86_64")]
-    const SIGJMP_BUF_LEN: usize = 38;
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    const SIGJMP_BUF_LEN: usize = 64;
-
-    #[repr(C, align(16))]
-    struct SigJmpBuf([std::os::raw::c_int; SIGJMP_BUF_LEN]);
-
-    unsafe extern "C" {
-        #[cfg_attr(target_os = "linux", link_name = "__sigsetjmp")]
-        safe fn sigsetjmp(
-            env: *mut std::ffi::c_void,
-            savemask: std::os::raw::c_int,
-        ) -> std::os::raw::c_int;
-        fn siglongjmp(env: *mut std::ffi::c_void, val: std::os::raw::c_int) -> !;
-    }
-
-    static GUARD_ACTIVE: AtomicBool = AtomicBool::new(false);
-    static CRASH_ADDR: AtomicU64 = AtomicU64::new(0);
-
-    struct JmpBufCell(std::cell::UnsafeCell<SigJmpBuf>);
-    // SAFETY: JmpBufCell is only accessed from the single thread that
-    // activates the guard (sets GUARD_ACTIVE, calls sigsetjmp). The signal
-    // handler only reads the buffer after checking GUARD_ACTIVE. Plugin
-    // loading is single-threaded, and the debug_assert prevents nesting.
-    unsafe impl Sync for JmpBufCell {}
-    static JUMP_BUF: JmpBufCell =
-        JmpBufCell(std::cell::UnsafeCell::new(SigJmpBuf([0; SIGJMP_BUF_LEN])));
-
-    unsafe extern "C" fn handler(_sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut c_void) {
-        if GUARD_ACTIVE.load(Ordering::Relaxed) {
-            if !info.is_null() {
-                CRASH_ADDR.store(
-                    unsafe { signal_fault_address(info) as u64 },
-                    Ordering::Relaxed,
-                );
-            }
-            unsafe { siglongjmp(JUMP_BUF.0.get().cast(), 1) };
-        }
-        unsafe {
-            libc::signal(libc::SIGSEGV, libc::SIG_DFL);
-            libc::raise(libc::SIGSEGV);
-        }
-    }
-
-    debug_assert!(
-        !GUARD_ACTIVE.load(Ordering::Relaxed),
-        "SIGSEGV guard nesting detected — only one guard may be active at a time"
-    );
-
-    let mut new_action: libc::sigaction = unsafe { std::mem::zeroed() };
-    new_action.sa_sigaction = handler as *const () as usize;
-    new_action.sa_flags = libc::SA_SIGINFO;
-    let mut old_action: libc::sigaction = unsafe { std::mem::zeroed() };
-    unsafe { libc::sigaction(libc::SIGSEGV, &new_action, &mut old_action) };
-
-    GUARD_ACTIVE.store(true, Ordering::Release);
-    CRASH_ADDR.store(0, Ordering::Relaxed);
-
-    let result = if sigsetjmp(JUMP_BUF.0.get().cast(), 1) == 0 {
-        unsafe { create_instance(library, library_path, name, bundle_ref) }
-    } else {
-        let addr = CRASH_ADDR.load(Ordering::Relaxed);
-        eprintln!("create_instance SIGSEGV: plugin={name}, fault_addr=0x{addr:x}");
-        tracing::error!(
-            plugin = %name,
-            fault_addr = format_args!("0x{addr:x}"),
-            "SIGSEGV during plugin loading (create_instance)"
-        );
-        Err(Vst3Error::LoadError(format!(
-            "SIGSEGV during plugin loading: fault_addr=0x{addr:x}"
-        )))
-    };
-
-    GUARD_ACTIVE.store(false, Ordering::Release);
-    unsafe { libc::sigaction(libc::SIGSEGV, &old_action, std::ptr::null_mut()) };
-
-    result
-}
-
-/// Call `IComponent::initialize` with SIGSEGV recovery.
-///
-/// Wraps just the vtable call, not the full `initialize()` method body,
-/// to avoid nesting with the `guarded_set_component_state` guard that
-/// runs inside `init_edit_controller()` later in the same method.
-///
-/// Returns the raw TResult on success, or `-1` if the call crashed.
-unsafe fn guarded_initialize_component(
+unsafe fn call_initialize_component(
     component: *mut c_void,
     component_vtbl: *const IComponentVtbl,
     host_ctx_ptr: *mut c_void,
-    plugin_name: &str,
+    _plugin_name: &str,
 ) -> i32 {
-    #[cfg(unix)]
-    {
-        unsafe {
-            guarded_initialize_component_unix(component, component_vtbl, host_ctx_ptr, plugin_name)
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = plugin_name;
-        unsafe { ((*component_vtbl).initialize)(component, host_ctx_ptr) }
-    }
-}
-
-#[cfg(unix)]
-unsafe fn guarded_initialize_component_unix(
-    component: *mut c_void,
-    component_vtbl: *const IComponentVtbl,
-    host_ctx_ptr: *mut c_void,
-    plugin_name: &str,
-) -> i32 {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-    #[cfg(target_arch = "aarch64")]
-    const SIGJMP_BUF_LEN: usize = 49;
-    #[cfg(target_arch = "x86_64")]
-    const SIGJMP_BUF_LEN: usize = 38;
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    const SIGJMP_BUF_LEN: usize = 64;
-
-    #[repr(C, align(16))]
-    struct SigJmpBuf([std::os::raw::c_int; SIGJMP_BUF_LEN]);
-
-    unsafe extern "C" {
-        #[cfg_attr(target_os = "linux", link_name = "__sigsetjmp")]
-        safe fn sigsetjmp(
-            env: *mut std::ffi::c_void,
-            savemask: std::os::raw::c_int,
-        ) -> std::os::raw::c_int;
-        fn siglongjmp(env: *mut std::ffi::c_void, val: std::os::raw::c_int) -> !;
-    }
-
-    static GUARD_ACTIVE: AtomicBool = AtomicBool::new(false);
-    static CRASH_ADDR: AtomicU64 = AtomicU64::new(0);
-
-    struct JmpBufCell(std::cell::UnsafeCell<SigJmpBuf>);
-    // SAFETY: JmpBufCell is only accessed from the single thread that
-    // activates the guard (sets GUARD_ACTIVE, calls sigsetjmp). The signal
-    // handler only reads the buffer after checking GUARD_ACTIVE. Plugin
-    // loading is single-threaded, and the debug_assert prevents nesting.
-    unsafe impl Sync for JmpBufCell {}
-    static JUMP_BUF: JmpBufCell =
-        JmpBufCell(std::cell::UnsafeCell::new(SigJmpBuf([0; SIGJMP_BUF_LEN])));
-
-    unsafe extern "C" fn handler(_sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut c_void) {
-        if GUARD_ACTIVE.load(Ordering::Relaxed) {
-            if !info.is_null() {
-                CRASH_ADDR.store(
-                    unsafe { signal_fault_address(info) as u64 },
-                    Ordering::Relaxed,
-                );
-            }
-            unsafe { siglongjmp(JUMP_BUF.0.get().cast(), 1) };
-        }
-        unsafe {
-            libc::signal(libc::SIGSEGV, libc::SIG_DFL);
-            libc::raise(libc::SIGSEGV);
-        }
-    }
-
-    debug_assert!(
-        !GUARD_ACTIVE.load(Ordering::Relaxed),
-        "SIGSEGV guard nesting detected — only one guard may be active at a time"
-    );
-
-    let mut new_action: libc::sigaction = unsafe { std::mem::zeroed() };
-    new_action.sa_sigaction = handler as *const () as usize;
-    new_action.sa_flags = libc::SA_SIGINFO;
-    let mut old_action: libc::sigaction = unsafe { std::mem::zeroed() };
-    unsafe { libc::sigaction(libc::SIGSEGV, &new_action, &mut old_action) };
-
-    GUARD_ACTIVE.store(true, Ordering::Release);
-    CRASH_ADDR.store(0, Ordering::Relaxed);
-
-    let result = if sigsetjmp(JUMP_BUF.0.get().cast(), 1) == 0 {
-        unsafe { ((*component_vtbl).initialize)(component, host_ctx_ptr) }
-    } else {
-        let addr = CRASH_ADDR.load(Ordering::Relaxed);
-        eprintln!("IComponent::initialize SIGSEGV: plugin={plugin_name}, fault_addr=0x{addr:x}");
-        tracing::error!(
-            plugin = %plugin_name,
-            fault_addr = format_args!("0x{addr:x}"),
-            "SIGSEGV during IComponent::initialize"
-        );
-        -1
-    };
-
-    GUARD_ACTIVE.store(false, Ordering::Release);
-    unsafe { libc::sigaction(libc::SIGSEGV, &old_action, std::ptr::null_mut()) };
-
-    result
-}
-
-#[cfg(unix)]
-unsafe fn guarded_set_component_state_unix(
-    controller: *mut c_void,
-    ctrl_vtbl: *const IEditControllerVtblHeadless,
-    stream: *mut c_void,
-    plugin_name: &str,
-) -> i32 {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-    // Jump buffer for sigsetjmp/siglongjmp.
-    #[cfg(target_arch = "aarch64")]
-    const SIGJMP_BUF_LEN: usize = 49;
-    #[cfg(target_arch = "x86_64")]
-    const SIGJMP_BUF_LEN: usize = 38;
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    const SIGJMP_BUF_LEN: usize = 64;
-
-    // Align to 16 bytes: ARM64 sigjmp_buf stores register state that
-    // may require 8+ byte alignment. 16 matches signal frame alignment.
-    #[repr(C, align(16))]
-    struct SigJmpBuf([std::os::raw::c_int; SIGJMP_BUF_LEN]);
-
-    unsafe extern "C" {
-        #[cfg_attr(target_os = "linux", link_name = "__sigsetjmp")]
-        safe fn sigsetjmp(
-            env: *mut std::ffi::c_void,
-            savemask: std::os::raw::c_int,
-        ) -> std::os::raw::c_int;
-        fn siglongjmp(env: *mut std::ffi::c_void, val: std::os::raw::c_int) -> !;
-    }
-
-    static GUARD_ACTIVE: AtomicBool = AtomicBool::new(false);
-    static CRASH_ADDR: AtomicU64 = AtomicU64::new(0);
-
-    struct JmpBufCell(std::cell::UnsafeCell<SigJmpBuf>);
-    // SAFETY: JmpBufCell is only accessed from the single thread that
-    // activates the guard (sets GUARD_ACTIVE, calls sigsetjmp). The signal
-    // handler only reads the buffer after checking GUARD_ACTIVE. Plugin
-    // loading is single-threaded, and the debug_assert prevents nesting.
-    unsafe impl Sync for JmpBufCell {}
-    static JUMP_BUF: JmpBufCell =
-        JmpBufCell(std::cell::UnsafeCell::new(SigJmpBuf([0; SIGJMP_BUF_LEN])));
-
-    unsafe extern "C" fn handler(_sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut c_void) {
-        if GUARD_ACTIVE.load(Ordering::Relaxed) {
-            if !info.is_null() {
-                CRASH_ADDR.store(
-                    unsafe { signal_fault_address(info) as u64 },
-                    Ordering::Relaxed,
-                );
-            }
-            unsafe { siglongjmp(JUMP_BUF.0.get().cast(), 1) };
-        }
-        // Not our guard — re-raise for default handling.
-        unsafe {
-            libc::signal(libc::SIGSEGV, libc::SIG_DFL);
-            libc::raise(libc::SIGSEGV);
-        }
-    }
-
-    // Check for nesting BEFORE installing handler — if the assert fires,
-    // we don't want the old handler to have been clobbered already.
-    debug_assert!(
-        !GUARD_ACTIVE.load(Ordering::Relaxed),
-        "SIGSEGV guard nesting detected — only one guard may be active at a time"
-    );
-
-    // Install handler.
-    let mut new_action: libc::sigaction = unsafe { std::mem::zeroed() };
-    new_action.sa_sigaction = handler as *const () as usize;
-    new_action.sa_flags = libc::SA_SIGINFO;
-    let mut old_action: libc::sigaction = unsafe { std::mem::zeroed() };
-    unsafe { libc::sigaction(libc::SIGSEGV, &new_action, &mut old_action) };
-
-    GUARD_ACTIVE.store(true, Ordering::Release);
-    CRASH_ADDR.store(0, Ordering::Relaxed);
-
-    let result = if sigsetjmp(JUMP_BUF.0.get().cast(), 1) == 0 {
-        unsafe { ((*ctrl_vtbl).set_component_state)(controller, stream) }
-    } else {
-        let addr = CRASH_ADDR.load(Ordering::Relaxed);
-        eprintln!("setComponentState SIGSEGV: plugin={plugin_name}, fault_addr=0x{addr:x}");
-        -1
-    };
-
-    GUARD_ACTIVE.store(false, Ordering::Release);
-
-    // Restore previous handler.
-    unsafe { libc::sigaction(libc::SIGSEGV, &old_action, std::ptr::null_mut()) };
-
-    result
+    unsafe { ((*component_vtbl).initialize)(component, host_ctx_ptr) }
 }
 
 #[cfg(test)]
@@ -2560,6 +2275,92 @@ mod tests {
 
     // Note: We can't test VstInstance::load without a real .so file,
     // but we can test the error path.
+    #[test]
+    fn connection_pair_rolls_back_partial_retaining_connections() {
+        #[repr(C)]
+        struct Peer {
+            vtable: *const IConnectionPointVtbl,
+            accepts: bool,
+            refs: u32,
+            connected: *mut c_void,
+        }
+        unsafe extern "C" fn qi(_: *mut c_void, _: *const TUID, _: *mut *mut c_void) -> i32 {
+            -1
+        }
+        unsafe extern "C" fn retain(this: *mut c_void) -> u32 {
+            unsafe {
+                let p = &mut *(this as *mut Peer);
+                p.refs += 1;
+                p.refs
+            }
+        }
+        unsafe extern "C" fn release(this: *mut c_void) -> u32 {
+            unsafe {
+                let p = &mut *(this as *mut Peer);
+                p.refs -= 1;
+                p.refs
+            }
+        }
+        unsafe extern "C" fn connect(this: *mut c_void, other: *mut c_void) -> i32 {
+            unsafe {
+                let p = &mut *(this as *mut Peer);
+                if !p.accepts {
+                    return K_RESULT_FALSE;
+                }
+                assert!(p.connected.is_null());
+                p.connected = other;
+                retain(other);
+                K_RESULT_OK
+            }
+        }
+        unsafe extern "C" fn disconnect(this: *mut c_void, other: *mut c_void) -> i32 {
+            unsafe {
+                let p = &mut *(this as *mut Peer);
+                assert_eq!(p.connected, other);
+                p.connected = std::ptr::null_mut();
+                release(other);
+                K_RESULT_OK
+            }
+        }
+        unsafe extern "C" fn notify(_: *mut c_void, _: *mut c_void) -> i32 {
+            K_RESULT_OK
+        }
+        static VTABLE: IConnectionPointVtbl = IConnectionPointVtbl {
+            query_interface: qi,
+            add_ref: retain,
+            release,
+            connect,
+            disconnect,
+            notify,
+        };
+        for accepts in [(true, false), (false, true), (false, false), (true, true)] {
+            let mut a = Peer {
+                vtable: &VTABLE,
+                accepts: accepts.0,
+                refs: 1,
+                connected: std::ptr::null_mut(),
+            };
+            let mut b = Peer {
+                vtable: &VTABLE,
+                accepts: accepts.1,
+                refs: 1,
+                connected: std::ptr::null_mut(),
+            };
+            let ap = std::ptr::from_mut(&mut a).cast();
+            let bp = std::ptr::from_mut(&mut b).cast();
+            unsafe {
+                let connected = connect_pair(ap, &VTABLE, bp, &VTABLE);
+                assert_eq!(connected, accepts.0 && accepts.1);
+                if connected {
+                    disconnect(ap, bp);
+                    disconnect(bp, ap);
+                }
+            }
+            assert_eq!((a.refs, b.refs), (1, 1));
+            assert!(a.connected.is_null() && b.connected.is_null());
+        }
+    }
+
     #[test]
     fn load_nonexistent_plugin() {
         let result = VstInstance::load(Path::new("/nonexistent/plugin.so"));

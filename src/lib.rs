@@ -43,8 +43,9 @@ pub use cli::scanner_cli_main;
 /// Execute a closure on the macOS main thread (dispatch_sync_f).
 ///
 /// On non-macOS platforms, runs the closure directly on the current thread.
-/// On macOS, falls back to direct execution if no NSApplication is running
-/// (test/CLI context) or if already on the main thread.
+/// On macOS, executes directly only on the main thread. A worker call requires
+/// a running main event loop; otherwise it panics before invoking the closure.
+/// Native owners must be dropped on the main thread or while it services UI work.
 ///
 /// VST3 plugins require their entire lifecycle —
 /// load, initialize, editor creation — to happen on the main thread.
@@ -67,11 +68,8 @@ where
     f()
 }
 
-/// Check if we're running in an application context (NSApplication on macOS).
-///
-/// Returns `true` if the process has a running event loop that can service
-/// AppKit operations like `IPlugView::attached()`. Returns `false` in test
-/// processes and CLI tools.
+/// Check whether the macOS main run loop is currently running.
+/// Native UI work still requires the main thread and a serviced application loop.
 #[cfg(target_os = "macos")]
 pub fn is_app_context() -> bool {
     editor::cocoa_is_app_context()

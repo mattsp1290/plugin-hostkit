@@ -76,11 +76,12 @@ impl PluginScanner {
     #[tracing::instrument(name = "discover_bundles", skip_all)]
     pub fn discover_bundles(&self) -> Vec<Vst3Bundle> {
         let mut bundles = Vec::new();
+        let mut visited = HashSet::new();
         for search_path in &self.search_paths {
             if !search_path.is_dir() {
                 continue;
             }
-            self.scan_directory(search_path, &mut bundles);
+            self.scan_directory(search_path, &mut bundles, &mut visited);
         }
         bundles.sort_by_key(|a| a.name.to_lowercase());
         bundles
@@ -125,7 +126,18 @@ impl PluginScanner {
         }
     }
 
-    fn scan_directory(&self, dir: &Path, bundles: &mut Vec<Vst3Bundle>) {
+    fn scan_directory(
+        &self,
+        dir: &Path,
+        bundles: &mut Vec<Vst3Bundle>,
+        visited: &mut HashSet<PathBuf>,
+    ) {
+        let Ok(canonical) = dir.canonicalize() else {
+            return;
+        };
+        if !visited.insert(canonical) {
+            return;
+        }
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(e) => {
@@ -137,10 +149,12 @@ impl PluginScanner {
             let path = entry.path();
             if path.is_dir() {
                 if let Some(bundle) = Vst3Bundle::from_path(&path) {
-                    bundles.push(bundle);
+                    if path.canonicalize().is_ok_and(|p| visited.insert(p)) {
+                        bundles.push(bundle);
+                    }
                 } else {
                     // Not a .vst3 bundle — recurse into vendor subfolders
-                    self.scan_directory(&path, bundles);
+                    self.scan_directory(&path, bundles, visited);
                 }
             }
         }
@@ -168,18 +182,19 @@ struct PluginMetadata {
 /// the factory scanner provides subcategories.
 fn query_plugin_metadata(bundle: &Vst3Bundle) -> Option<PluginMetadata> {
     // Try moduleinfo.json first (VST3 SDK 3.7+)
-    if let Some(meta) = parse_moduleinfo_json(&bundle.path)
-        && !meta.subcategories.is_empty()
+    let module_meta = parse_moduleinfo_json(&bundle.path);
+    if module_meta
+        .as_ref()
+        .is_some_and(|meta| !meta.subcategories.is_empty())
     {
-        return Some(meta);
+        return module_meta;
     }
-    // File existed but had no subcategories (e.g., empty file) — fall through
 
     // Get plist-based metadata (vendor/version only, no subcategories)
     #[cfg(target_os = "macos")]
-    let plist_meta = parse_info_plist(&bundle.path);
+    let plist_meta = module_meta.or_else(|| parse_info_plist(&bundle.path));
     #[cfg(not(target_os = "macos"))]
-    let plist_meta: Option<PluginMetadata> = None;
+    let plist_meta: Option<PluginMetadata> = module_meta;
 
     // Try out-of-process scanner for subcategories.
     // Skip plugins that previously crashed during scanning.
@@ -363,14 +378,84 @@ fn find_scanner_binary() -> Option<PathBuf> {
     None
 }
 
+const MAX_METADATA_BYTES: u64 = 1024 * 1024;
+
+struct MetadataCapture {
+    file: Option<std::fs::File>,
+    path: PathBuf,
+}
+
+impl MetadataCapture {
+    fn new() -> std::io::Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        for _ in 0..32 {
+            let path = std::env::temp_dir().join(format!(
+                "plugin-hostkit-{}-{}-{}.scan",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&path) {
+                Ok(file) => {
+                    return Ok(Self {
+                        file: Some(file),
+                        path,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "metadata capture collisions",
+        ))
+    }
+
+    fn read_bounded(&mut self) -> std::io::Result<Vec<u8>> {
+        use std::io::{Read, Seek};
+        let file = self.file.as_mut().expect("capture remains open");
+        file.rewind()?;
+        let mut bytes = Vec::new();
+        file.take(MAX_METADATA_BYTES + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_METADATA_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "metadata output too large",
+            ));
+        }
+        Ok(bytes)
+    }
+}
+
+impl Drop for MetadataCapture {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// Spawn the out-of-process scanner for a single plugin binary.
 ///
 /// Returns parsed metadata, or None if the child crashes, times out,
 /// or produces invalid output.
 fn query_metadata_out_of_process(scanner_bin: &Path, binary_path: &Path) -> Option<PluginMetadata> {
+    let mut capture = MetadataCapture::new().ok()?;
+    let output = capture.file.as_ref()?.try_clone().ok()?;
     let mut child = match Command::new(scanner_bin)
         .arg(binary_path)
-        .stdout(std::process::Stdio::piped())
+        .stdout(output)
         .stderr(std::process::Stdio::null())
         .spawn()
     {
@@ -396,8 +481,8 @@ fn query_metadata_out_of_process(scanner_bin: &Path, binary_path: &Path) -> Opti
                     }
                     return None;
                 }
-                let output = child.wait_with_output().ok()?;
-                let json: serde_json::Value = match serde_json::from_slice(&output.stdout) {
+                let bytes = capture.read_bounded().ok()?;
+                let json: serde_json::Value = match serde_json::from_slice(&bytes) {
                     Ok(v) => v,
                     Err(e) => {
                         tracing::warn!(
@@ -427,7 +512,13 @@ fn query_metadata_out_of_process(scanner_bin: &Path, binary_path: &Path) -> Opti
                 });
             }
             Ok(None) => {
-                if start.elapsed() > SCANNER_TIMEOUT {
+                if start.elapsed() > SCANNER_TIMEOUT
+                    || capture
+                        .file
+                        .as_ref()
+                        .and_then(|f| f.metadata().ok())
+                        .is_none_or(|m| m.len() > MAX_METADATA_BYTES)
+                {
                     tracing::warn!(
                         binary = %binary_path.display(),
                         timeout_secs = SCANNER_TIMEOUT.as_secs(),
@@ -448,6 +539,8 @@ fn query_metadata_out_of_process(scanner_bin: &Path, binary_path: &Path) -> Opti
                     error = %e,
                     "failed to check out-of-process scanner status"
                 );
+                let _ = child.kill();
+                let _ = child.wait();
                 return None;
             }
         }
@@ -465,7 +558,7 @@ fn query_metadata_out_of_process(scanner_bin: &Path, binary_path: &Path) -> Opti
 ///     "Name": "Plugin Name",
 ///     "Vendor": "Vendor Name",
 ///     "Version": "1.0.0",
-///     "Sub Categories": "Instrument|Synth",
+///     "Sub Categories": ["Instrument", "Synth"],
 ///     ...
 ///   }],
 ///   "Factory Info": { "Vendor": "...", ... }
@@ -506,11 +599,15 @@ fn parse_moduleinfo_json(bundle_path: &Path) -> Option<PluginMetadata> {
     for class in classes {
         let category = class.get("Category").and_then(|c| c.as_str()).unwrap_or("");
         if category == "Audio Module Class" {
-            let subcategories = class
-                .get("Sub Categories")
-                .and_then(|s| s.as_str())
-                .unwrap_or("")
-                .to_string();
+            let subcategories = match class.get("Sub Categories") {
+                Some(serde_json::Value::Array(values)) => values
+                    .iter()
+                    .map(serde_json::Value::as_str)
+                    .collect::<Option<Vec<_>>>()?
+                    .join("|"),
+                Some(serde_json::Value::String(value)) => value.clone(),
+                _ => String::new(),
+            };
             let vendor = class
                 .get("Vendor")
                 .and_then(|v| v.as_str())
@@ -590,6 +687,73 @@ impl Default for PluginScanner {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sdk_metadata_without_categories_preserves_vendor_and_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let contents = temp.path().join("Contents");
+        fs::create_dir(&contents).unwrap();
+        fs::write(contents.join("moduleinfo.json"), r#"{"Factory Info":{"Vendor":"Factory"},"Classes":[{"Category":"Audio Module Class","Vendor":"ClassVendor","Version":"1.2"}]}"#).unwrap();
+        let bundle = Vst3Bundle {
+            path: temp.path().to_path_buf(),
+            name: "Fixture".into(),
+            binary_path: None,
+        };
+        let metadata = query_plugin_metadata(&bundle).unwrap();
+        assert_eq!(metadata.vendor, "ClassVendor");
+        assert_eq!(metadata.version, "1.2");
+        assert!(metadata.subcategories.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scanner_capture_handles_large_output_and_inherited_descriptors() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let helper = temp.path().join("helper");
+        let vendor = "x".repeat(256 * 1024);
+        let json = serde_json::json!({"vendor":vendor,"version":"1","subcategories":"Instrument"});
+        fs::write(&helper, format!("#!/bin/sh\nprintf '%s' '{}'\n", json)).unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+        let result = query_metadata_out_of_process(&helper, temp.path()).unwrap();
+        assert_eq!(result.vendor.len(), 256 * 1024);
+        fs::write(
+            &helper,
+            r#"#!/bin/sh
+(sleep 2) &
+printf '%s' '{"vendor":"descendant"}'
+"#,
+        )
+        .unwrap();
+        let start = Instant::now();
+        assert_eq!(
+            query_metadata_out_of_process(&helper, temp.path())
+                .unwrap()
+                .vendor,
+            "descendant"
+        );
+        assert!(start.elapsed() < Duration::from_millis(1500));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn discovery_deduplicates_directory_and_bundle_symlinks() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("Fixture.vst3")).unwrap();
+        symlink(temp.path(), temp.path().join("cycle")).unwrap();
+        symlink(
+            temp.path().join("Fixture.vst3"),
+            temp.path().join("Alias.vst3"),
+        )
+        .unwrap();
+        assert_eq!(
+            PluginScanner::with_paths(vec![temp.path().into(), temp.path().into()])
+                .discover_bundles()
+                .len(),
+            1
+        );
+    }
+
     #[test]
     fn plugin_kind_matches_subcategories() {
         for (text, expected) in [
@@ -708,7 +872,7 @@ mod tests {
                 "Name": "TestSynth",
                 "Vendor": "Test Corp",
                 "Version": "2.1.0",
-                "Sub Categories": "Instrument|Synth"
+                "Sub Categories": ["Instrument", "Synth"]
             }]
         });
         fs::write(
@@ -726,6 +890,10 @@ mod tests {
         assert_eq!(meta.vendor, "Test Corp");
         assert_eq!(meta.version, "2.1.0");
         assert_eq!(meta.subcategories, "Instrument|Synth");
+        assert_eq!(
+            PluginKind::from_subcategories(&meta.subcategories),
+            PluginKind::Instrument
+        );
     }
 
     #[test]

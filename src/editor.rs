@@ -13,22 +13,19 @@ use crate::com::{
 use crate::error::Vst3Error;
 
 /// Process-level flag indicating this is a disposable child process.
-/// Set by the `vst3-renderer` binary at startup. Currently unused as
-/// SIGSEGV guards are now always active, but retained for potential
-/// future process-type-specific behavior.
+/// Retained as a compatibility marker for consuming child executables.
+/// Native faults remain process-fatal in every process.
 static IS_CHILD_PROCESS: AtomicBool = AtomicBool::new(false);
 
-/// Mark this process as a disposable child where SIGSEGV recovery via
-/// siglongjmp is acceptable. Must be called early in main() before any
-/// editor operations.
+/// Mark this process as a disposable child. This compatibility marker does
+/// not enable in-process signal recovery.
 pub fn mark_as_child_process() {
     IS_CHILD_PROCESS.store(true, Ordering::Relaxed);
 }
 
-/// Check if this process is a disposable child where SIGSEGV recovery
-/// via siglongjmp is acceptable.
+/// Check the compatibility child-process marker.
 #[cfg(target_os = "linux")]
-#[allow(dead_code)] // Reserved for child-process editor guards.
+#[allow(dead_code)] // Retained compatibility marker.
 pub(crate) fn is_child_process() -> bool {
     // Relaxed is sufficient: mark_as_child_process is called once at process
     // startup before any threads are spawned, so no Release/Acquire edge needed.
@@ -550,7 +547,7 @@ impl EditorView {
 
                     unsafe {
                         tracing::info!("calling IEditController::createView on main thread");
-                        let view = guarded_create_view(ctrl, ctrl_vtbl);
+                        let view = call_create_view(ctrl, ctrl_vtbl);
                         if view.is_null() {
                             tracing::warn!(
                                 "createView returned null for all attempts (editor, nullptr, queryInterface)"
@@ -638,7 +635,7 @@ impl EditorView {
         #[cfg(not(target_os = "macos"))]
         let (view, view_vtbl, size, can_resize) = {
             tracing::info!("calling IEditController::createView");
-            let view = unsafe { guarded_create_view(controller, controller_vtbl) };
+            let view = unsafe { call_create_view(controller, controller_vtbl) };
 
             if view.is_null() {
                 tracing::warn!(
@@ -763,6 +760,11 @@ impl EditorView {
         &mut self,
         on_close: Option<Box<dyn FnOnce() + Send + 'static>>,
     ) -> Result<(), Vst3Error> {
+        if !cocoa::can_dispatch() {
+            return Err(Vst3Error::InitFailed(
+                "main-thread UI loop unavailable".into(),
+            ));
+        }
         if self.closed || self.attached {
             return Err(Vst3Error::RenderError(
                 "editor is closed or already attached".into(),
@@ -780,7 +782,6 @@ impl EditorView {
         // only accessed on the main thread inside the closure.
         let view_addr = self.view as usize;
         let view_vtbl_addr = self.view_vtbl as usize;
-        let ctrl_addr = self.controller as usize;
         let can_resize = self.can_resize;
         let plug_frame_ptr = &mut *self._plug_frame as *mut PlugFrameObj as usize;
 
@@ -798,17 +799,9 @@ impl EditorView {
             // to be in a visible, on-screen window with a valid backing store.
             window.show();
 
-            // Call attached() inside a SIGSEGV guard. Some plugins crash
-            // during view construction. The guard catches
-            // the signal and returns an error instead of terminating.
-            tracing::info!("window shown, calling IPlugView::attached");
-            tracing::debug!(
-                view = format_args!("0x{view_addr:x}"),
-                controller = format_args!("0x{ctrl_addr:x}"),
-                "crash correlation pointers"
-            );
+            // Native faults in attached() are process-fatal.
             let result =
-                unsafe { guarded_attached(view, view_vtbl, PLATFORM_TYPE.as_ptr(), view_ptr) };
+                unsafe { call_attached(view, view_vtbl, PLATFORM_TYPE.as_ptr(), view_ptr) };
             tracing::info!(result, "IPlugView::attached returned");
 
             if result != K_RESULT_OK {
@@ -1086,372 +1079,22 @@ impl Drop for EditorView {
     }
 }
 
-// ── SIGSEGV-guarded attached() ────────────────────────────────────────
-//
-// Best-effort reporting for synchronous faults inside IPlugView::attached().
-// This does not contain faults on plugin threads or make recovery safe.
-//
-// Uses sigsetjmp/siglongjmp which are async-signal-safe and restore
-// the signal mask. The plugin's internal state may be inconsistent
-// after a caught crash, but the host process survives.
-
-#[cfg(target_os = "macos")]
-mod sig_guard {
-    use std::os::raw::c_int;
-
-    // macOS ARM64: sigjmp_buf = int[49] (196 bytes)
-    // macOS x86_64: sigjmp_buf = int[38] (152 bytes)
-    // Use the larger size for both architectures.
-    const SIGJMP_BUF_LEN: usize = 49;
-
-    #[repr(C)]
-    pub struct SigJmpBuf {
-        pub _data: [c_int; SIGJMP_BUF_LEN],
-    }
-
-    impl SigJmpBuf {
-        pub const fn zeroed() -> Self {
-            Self {
-                _data: [0; SIGJMP_BUF_LEN],
-            }
-        }
-    }
-
-    unsafe extern "C" {
-        pub safe fn sigsetjmp(env: *mut std::ffi::c_void, savemask: c_int) -> c_int;
-        pub fn siglongjmp(env: *mut std::ffi::c_void, val: c_int) -> !;
-    }
-}
-
-/// SIGSEGV-guarded wrapper around `IEditController::createView()`.
-///
-/// Wraps `try_create_view()` in a `sigsetjmp`/`siglongjmp` guard so that
-/// a fault during native view creation can be reported as unavailable. Returns `std::ptr::null_mut()` on crash, which the caller
-/// handles gracefully as "no editor available".
-///
-/// # Safety
-///
-/// Same caveats as `guarded_attached()`: `siglongjmp` from a signal handler
-/// is UB per POSIX when it interrupts non-async-signal-safe code. The
-/// guarded region is a COM vtable call into plugin code with no Rust
-/// destructors on the stack.
-#[cfg(target_os = "macos")]
-unsafe fn guarded_create_view(
-    controller: *mut c_void,
-    controller_vtbl: *const IEditControllerVtbl,
-) -> *mut c_void {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-    static GUARD_ACTIVE: AtomicBool = AtomicBool::new(false);
-
-    struct JumpBufHolder(std::cell::UnsafeCell<sig_guard::SigJmpBuf>);
-    unsafe impl Sync for JumpBufHolder {}
-    static JUMP_BUF: JumpBufHolder =
-        JumpBufHolder(std::cell::UnsafeCell::new(sig_guard::SigJmpBuf::zeroed()));
-
-    static CRASH_SIG: AtomicU64 = AtomicU64::new(0);
-    static CRASH_PC: AtomicU64 = AtomicU64::new(0);
-    static CRASH_ADDR: AtomicU64 = AtomicU64::new(0);
-    static CRASH_X0: AtomicU64 = AtomicU64::new(0);
-    static CRASH_X19: AtomicU64 = AtomicU64::new(0);
-    static CRASH_X20: AtomicU64 = AtomicU64::new(0);
-    static CRASH_X21: AtomicU64 = AtomicU64::new(0);
-    static CRASH_LR: AtomicU64 = AtomicU64::new(0);
-
-    unsafe extern "C" fn crash_handler(
-        sig: libc::c_int,
-        info: *mut libc::siginfo_t,
-        ctx: *mut c_void,
-    ) {
-        if GUARD_ACTIVE.load(Ordering::Relaxed) {
-            if !info.is_null() {
-                CRASH_ADDR.store(unsafe { (*info).si_addr as u64 }, Ordering::Relaxed);
-            }
-            CRASH_SIG.store(sig as u64, Ordering::Relaxed);
-            #[cfg(target_arch = "aarch64")]
-            if !ctx.is_null() {
-                let mctx = unsafe { *((ctx as *const u8).add(48) as *const *const u8) };
-                if !mctx.is_null() {
-                    CRASH_PC.store(unsafe { *(mctx.add(272) as *const u64) }, Ordering::Relaxed);
-                    CRASH_X0.store(unsafe { *(mctx.add(16) as *const u64) }, Ordering::Relaxed);
-                    CRASH_X19.store(unsafe { *(mctx.add(168) as *const u64) }, Ordering::Relaxed);
-                    CRASH_X20.store(unsafe { *(mctx.add(176) as *const u64) }, Ordering::Relaxed);
-                    CRASH_X21.store(unsafe { *(mctx.add(184) as *const u64) }, Ordering::Relaxed);
-                    CRASH_LR.store(unsafe { *(mctx.add(256) as *const u64) }, Ordering::Relaxed);
-                }
-            }
-            #[cfg(target_arch = "x86_64")]
-            if !ctx.is_null() {
-                let mctx = unsafe { *((ctx as *const u8).add(48) as *const *const u8) };
-                if !mctx.is_null() {
-                    CRASH_PC.store(unsafe { *(mctx.add(144) as *const u64) }, Ordering::Relaxed);
-                }
-            }
-
-            unsafe { sig_guard::siglongjmp(JUMP_BUF.0.get().cast(), 1) };
-        }
-        // Not our guard — re-raise for default handling
-        unsafe {
-            libc::signal(sig, libc::SIG_DFL);
-            libc::raise(sig);
-        }
-    }
-
-    let mut new_action: libc::sigaction = unsafe { std::mem::zeroed() };
-    new_action.sa_sigaction = crash_handler as *const () as usize;
-    new_action.sa_flags = libc::SA_SIGINFO;
-    let mut old_segv: libc::sigaction = unsafe { std::mem::zeroed() };
-    let mut old_bus: libc::sigaction = unsafe { std::mem::zeroed() };
-
-    debug_assert!(
-        !GUARD_ACTIVE.load(Ordering::Relaxed),
-        "createView SIGSEGV guard nesting detected"
-    );
-
-    unsafe {
-        libc::sigaction(libc::SIGSEGV, &new_action, &mut old_segv);
-        libc::sigaction(libc::SIGBUS, &new_action, &mut old_bus);
-    };
-
-    GUARD_ACTIVE.store(true, Ordering::Release);
-    CRASH_SIG.store(0, Ordering::Relaxed);
-    CRASH_PC.store(0, Ordering::Relaxed);
-    CRASH_ADDR.store(0, Ordering::Relaxed);
-    CRASH_X0.store(0, Ordering::Relaxed);
-    CRASH_X19.store(0, Ordering::Relaxed);
-    CRASH_X20.store(0, Ordering::Relaxed);
-    CRASH_X21.store(0, Ordering::Relaxed);
-    CRASH_LR.store(0, Ordering::Relaxed);
-
-    let view = if sig_guard::sigsetjmp(JUMP_BUF.0.get().cast(), 1) == 0 {
-        // Normal path: call createView
-        unsafe { try_create_view(controller, controller_vtbl) }
-    } else {
-        // Signal caught — createView() crashed. Report diagnostics.
-        let sig = CRASH_SIG.load(Ordering::Relaxed);
-        let sig_name = match sig as i32 {
-            libc::SIGSEGV => "SIGSEGV",
-            libc::SIGBUS => "SIGBUS",
-            _ => "unknown",
-        };
-        let pc = CRASH_PC.load(Ordering::Relaxed);
-        let addr = CRASH_ADDR.load(Ordering::Relaxed);
-        let x0 = CRASH_X0.load(Ordering::Relaxed);
-        let x19 = CRASH_X19.load(Ordering::Relaxed);
-        let x20 = CRASH_X20.load(Ordering::Relaxed);
-        let x21 = CRASH_X21.load(Ordering::Relaxed);
-        let lr = CRASH_LR.load(Ordering::Relaxed);
-        let (module_base, module_offset) = find_plugin_module_offset(pc);
-
-        let msg = format!(
-            "IEditController::createView() {sig_name}: \
-             pc=module+0x{module_offset:x}, fault_addr=0x{addr:x}, \
-             x0=0x{x0:x}, x19=0x{x19:x}, x20=0x{x20:x}, x21=0x{x21:x}, \
-             lr=0x{lr:x}, module_base=0x{module_base:x}"
-        );
-        tracing::error!("{msg}");
-        eprintln!("{msg}");
-        std::ptr::null_mut()
-    };
-
-    GUARD_ACTIVE.store(false, Ordering::Release);
-    unsafe {
-        libc::sigaction(libc::SIGSEGV, &old_segv, std::ptr::null_mut());
-        libc::sigaction(libc::SIGBUS, &old_bus, std::ptr::null_mut());
-    };
-
-    view
-}
-
-/// Non-macOS fallback: call `try_create_view()` directly (no guard).
-#[cfg(not(target_os = "macos"))]
-unsafe fn guarded_create_view(
+// Foreign faults remain process-fatal; callers isolate untrusted UI code.
+unsafe fn call_create_view(
     controller: *mut c_void,
     controller_vtbl: *const IEditControllerVtbl,
 ) -> *mut c_void {
     unsafe { try_create_view(controller, controller_vtbl) }
 }
 
-/// SIGSEGV-guarded wrapper around `IPlugView::attached()`.
-///
-/// # Safety
-///
-/// This function uses `siglongjmp` from a SIGSEGV signal handler, which is
-/// **undefined behavior** per POSIX when it interrupts non-async-signal-safe
-/// code (heap allocations, C++ destructors, mutex operations, etc.).
-///
-/// If a plugin crashes during `attached()`, `siglongjmp` unwinds back to the
-/// `sigsetjmp` call site. This risks heap corruption, but the alternative is
-/// guaranteed process death from the SIGSEGV. The guarded call site is a COM
-/// vtable call into plugin code (C++ ABI) with no Rust destructors on the
-/// stack within the guarded region.
 #[cfg(target_os = "macos")]
-unsafe fn guarded_attached(
+unsafe fn call_attached(
     view: *mut c_void,
     view_vtbl: *const IPlugViewVtbl,
     platform_type: *const u8,
     parent: *mut c_void,
 ) -> TResult {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-    // Global state for the signal handler. Only one attached() call at a time
-    // (always on the main thread), so no contention.
-    static GUARD_ACTIVE: AtomicBool = AtomicBool::new(false);
-
-    // UnsafeCell wrapper for the jump buffer — avoids `static mut` unsoundness.
-    // Safety: only accessed from the main thread (one attached() at a time)
-    // and from the signal handler (which runs on the same thread).
-    struct JumpBufHolder(std::cell::UnsafeCell<sig_guard::SigJmpBuf>);
-    unsafe impl Sync for JumpBufHolder {}
-    static JUMP_BUF: JumpBufHolder =
-        JumpBufHolder(std::cell::UnsafeCell::new(sig_guard::SigJmpBuf::zeroed()));
-
-    // Crash diagnostics — written by the signal handler, read after siglongjmp.
-    // Only one attached() call at a time (main thread), so no races.
-    static CRASH_PC: AtomicU64 = AtomicU64::new(0);
-    static CRASH_ADDR: AtomicU64 = AtomicU64::new(0);
-    static CRASH_X0: AtomicU64 = AtomicU64::new(0);
-    static CRASH_X19: AtomicU64 = AtomicU64::new(0);
-    static CRASH_X20: AtomicU64 = AtomicU64::new(0);
-    static CRASH_X21: AtomicU64 = AtomicU64::new(0);
-    static CRASH_LR: AtomicU64 = AtomicU64::new(0);
-
-    unsafe extern "C" fn sigsegv_handler(
-        _sig: libc::c_int,
-        info: *mut libc::siginfo_t,
-        ctx: *mut c_void,
-    ) {
-        if GUARD_ACTIVE.load(Ordering::Relaxed) {
-            if !info.is_null() {
-                CRASH_ADDR.store(unsafe { (*info).si_addr as u64 }, Ordering::Relaxed);
-            }
-            // Read registers from ucontext_t (macOS layout).
-            // ucontext_t.uc_mcontext is a pointer at byte offset 48.
-            // mcontext layout (ARM64):
-            //   __es: 16 bytes (exception state)
-            //   __ss: thread state — x[0..29] at offset 16, fp/lr/sp/pc after
-            //     x0  at mctx + 16 + 0*8  = 16
-            //     x20 at mctx + 16 + 20*8 = 176
-            //     lr  at mctx + 16 + 30*8  = 256
-            //     pc  at mctx + 16 + 32*8  = 272
-            #[cfg(target_arch = "aarch64")]
-            if !ctx.is_null() {
-                let mctx = unsafe { *((ctx as *const u8).add(48) as *const *const u8) };
-                if !mctx.is_null() {
-                    CRASH_PC.store(unsafe { *(mctx.add(272) as *const u64) }, Ordering::Relaxed);
-                    CRASH_X0.store(unsafe { *(mctx.add(16) as *const u64) }, Ordering::Relaxed);
-                    // x19 at mctx + 16 + 19*8 = 168, x20 at 176, x21 at 184
-                    CRASH_X19.store(unsafe { *(mctx.add(168) as *const u64) }, Ordering::Relaxed);
-                    CRASH_X20.store(unsafe { *(mctx.add(176) as *const u64) }, Ordering::Relaxed);
-                    CRASH_X21.store(unsafe { *(mctx.add(184) as *const u64) }, Ordering::Relaxed);
-                    CRASH_LR.store(unsafe { *(mctx.add(256) as *const u64) }, Ordering::Relaxed);
-                }
-            }
-            #[cfg(target_arch = "x86_64")]
-            if !ctx.is_null() {
-                let mctx = unsafe { *((ctx as *const u8).add(48) as *const *const u8) };
-                if !mctx.is_null() {
-                    CRASH_PC.store(unsafe { *(mctx.add(144) as *const u64) }, Ordering::Relaxed);
-                }
-            }
-
-            unsafe { sig_guard::siglongjmp(JUMP_BUF.0.get().cast(), 1) };
-        }
-        // Not our guard — re-raise for default handling
-        unsafe {
-            libc::signal(libc::SIGSEGV, libc::SIG_DFL);
-            libc::raise(libc::SIGSEGV);
-        }
-    }
-
-    // Install our handler, saving the previous one
-    let mut new_action: libc::sigaction = unsafe { std::mem::zeroed() };
-    new_action.sa_sigaction = sigsegv_handler as *const () as usize;
-    new_action.sa_flags = libc::SA_SIGINFO;
-    let mut old_action: libc::sigaction = unsafe { std::mem::zeroed() };
-    // Check for nesting BEFORE installing handler — if the assert fires,
-    // we don't want the old handler to have been clobbered already.
-    debug_assert!(
-        !GUARD_ACTIVE.load(Ordering::Relaxed),
-        "SIGSEGV guard nesting detected — only one guard may be active at a time"
-    );
-
-    unsafe { libc::sigaction(libc::SIGSEGV, &new_action, &mut old_action) };
-
-    GUARD_ACTIVE.store(true, Ordering::Release);
-    CRASH_PC.store(0, Ordering::Relaxed);
-    CRASH_ADDR.store(0, Ordering::Relaxed);
-    CRASH_X0.store(0, Ordering::Relaxed);
-    CRASH_X19.store(0, Ordering::Relaxed);
-    CRASH_X20.store(0, Ordering::Relaxed);
-    CRASH_X21.store(0, Ordering::Relaxed);
-    CRASH_LR.store(0, Ordering::Relaxed);
-
-    let result = if sig_guard::sigsetjmp(JUMP_BUF.0.get().cast(), 1) == 0 {
-        // Normal path: call attached()
-        unsafe { ((*view_vtbl).attached)(view, parent, platform_type) }
-    } else {
-        // SIGSEGV caught — attached() crashed. Report diagnostics.
-        let pc = CRASH_PC.load(Ordering::Relaxed);
-        let addr = CRASH_ADDR.load(Ordering::Relaxed);
-        let x0 = CRASH_X0.load(Ordering::Relaxed);
-        let x19 = CRASH_X19.load(Ordering::Relaxed);
-        let x20 = CRASH_X20.load(Ordering::Relaxed);
-        let x21 = CRASH_X21.load(Ordering::Relaxed);
-        let lr = CRASH_LR.load(Ordering::Relaxed);
-        let (module_base, module_offset) = find_plugin_module_offset(pc);
-
-        let msg = format!(
-            "IPlugView::attached() SIGSEGV: \
-             pc=module+0x{module_offset:x}, fault_addr=0x{addr:x}, \
-             x0=0x{x0:x}, x19=0x{x19:x}, x20=0x{x20:x}, x21=0x{x21:x}, \
-             lr=0x{lr:x}, module_base=0x{module_base:x}"
-        );
-        tracing::error!("{msg}");
-        eprintln!("{msg}");
-        -1 // kResultFalse
-    };
-
-    GUARD_ACTIVE.store(false, Ordering::Release);
-
-    // Restore previous handler
-    unsafe { libc::sigaction(libc::SIGSEGV, &old_action, std::ptr::null_mut()) };
-
-    result
-}
-
-/// Find the plugin dylib base address and compute the offset of a PC within it.
-/// Matches any loaded image whose path contains ".vst3".
-/// Returns (module_base, offset). If no matching module is found, returns (0, pc).
-#[cfg(target_os = "macos")]
-fn find_plugin_module_offset(pc: u64) -> (u64, u64) {
-    // _dyld_image_count and _dyld_get_image_name are safe to call from any thread.
-    unsafe extern "C" {
-        fn _dyld_image_count() -> u32;
-        fn _dyld_get_image_name(image_index: u32) -> *const std::ffi::c_char;
-        fn _dyld_get_image_vmaddr_slide(image_index: u32) -> isize;
-    }
-
-    let count = unsafe { _dyld_image_count() };
-    for i in 0..count {
-        let name_ptr = unsafe { _dyld_get_image_name(i) };
-        if name_ptr.is_null() {
-            continue;
-        }
-        let name = unsafe { std::ffi::CStr::from_ptr(name_ptr) };
-        let name_bytes = name.to_bytes();
-        // Match ".vst3" in the image path to find the plugin dylib
-        if name_bytes.windows(5).any(|w| w == b".vst3") {
-            let slide = unsafe { _dyld_get_image_vmaddr_slide(i) } as u64;
-            // Module base = slide (on macOS, __TEXT vmaddr is typically 0 for dylibs,
-            // so the slide IS the load address). For Mach-O with non-zero __TEXT vmaddr,
-            // base = slide + __TEXT.vmaddr, but for our purposes the offset from slide
-            // is what matters for correlating with the on-disk binary.
-            let offset = pc.wrapping_sub(slide);
-            return (slide, offset);
-        }
-    }
-    (0, pc)
+    unsafe { ((*view_vtbl).attached)(view, parent, platform_type) }
 }
 
 // ── Linux X11 window creation (dynamic loading) ─────────────────────
@@ -2411,10 +2054,12 @@ mod cocoa {
 
     struct DispatchFns {
         pthread_main_np: unsafe extern "C" fn() -> i32,
-        // ObjC runtime — for checking if NSApplication is running
-        objc_get_class: unsafe extern "C" fn(*const u8) -> *mut c_void,
         sel_register_name: unsafe extern "C" fn(*const u8) -> *mut c_void,
         msg_send: *const c_void,
+        main_queue: *mut c_void,
+        dispatch_async:
+            unsafe extern "C" fn(*mut c_void, *mut c_void, unsafe extern "C" fn(*mut c_void)),
+        cf_run_loop_copy_current_mode: unsafe extern "C" fn(*mut c_void) -> *const c_void,
         // CoreFoundation run loop dispatch — replaces dispatch_sync_f to avoid
         // reentrant GCD deadlocks when plugins call dispatch_sync(main_queue).
         cf_run_loop_get_main: unsafe extern "C" fn() -> *mut c_void,
@@ -2436,8 +2081,7 @@ mod cocoa {
     static DISPATCH: LazyLock<DispatchFns> = LazyLock::new(|| {
         let lib = unsafe { libloading::Library::new("libSystem.B.dylib") }
             .expect("failed to load libSystem.B.dylib");
-        let objc = unsafe { libloading::Library::new("libobjc.A.dylib") }
-            .expect("failed to load libobjc.A.dylib");
+        let objc = unsafe { libloading::Library::new("libobjc.A.dylib") }.expect("libobjc");
         let cf = unsafe {
             libloading::Library::new(
                 "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation",
@@ -2446,12 +2090,15 @@ mod cocoa {
         .expect("failed to load CoreFoundation");
         unsafe {
             let pthread_main_np = *lib.get(b"pthread_main_np").expect("pthread_main_np");
-            let objc_get_class = *objc.get(b"objc_getClass").expect("objc_getClass");
             let sel_register_name = *objc.get(b"sel_registerName").expect("sel_registerName");
-            let msg_send_sym = objc
+            let msg_send = *objc
                 .get::<unsafe extern "C" fn()>(b"objc_msgSend")
-                .expect("objc_msgSend");
-            let msg_send = *msg_send_sym as *const c_void;
+                .expect("objc_msgSend") as *const c_void;
+            let main_queue = *lib.get(b"_dispatch_main_q").expect("main dispatch queue");
+            let dispatch_async = *lib.get(b"dispatch_async_f").expect("dispatch_async_f");
+            let cf_run_loop_copy_current_mode = *cf
+                .get(b"CFRunLoopCopyCurrentMode")
+                .expect("CFRunLoopCopyCurrentMode");
 
             let cf_run_loop_get_main = *cf.get(b"CFRunLoopGetMain").expect("CFRunLoopGetMain");
             let cf_run_loop_source_create = *cf
@@ -2477,13 +2124,15 @@ mod cocoa {
 
             // Keep loaded for process lifetime — all are always resident anyway
             std::mem::forget(lib);
-            std::mem::forget(objc);
             std::mem::forget(cf);
+            std::mem::forget(objc);
             DispatchFns {
-                pthread_main_np,
-                objc_get_class,
                 sel_register_name,
                 msg_send,
+                pthread_main_np,
+                main_queue,
+                dispatch_async,
+                cf_run_loop_copy_current_mode,
                 cf_run_loop_get_main,
                 cf_run_loop_source_create,
                 cf_run_loop_add_source,
@@ -2496,28 +2145,31 @@ mod cocoa {
         }
     });
 
-    /// Check if the main run loop is being serviced (NSApplication is running).
-    ///
-    /// In test processes and CLI tools, there is no NSApplication, so
-    /// run loop sources would never fire. This check allows
-    /// `run_on_main_sync` to fall back to direct execution in those contexts.
+    /// Query CoreFoundation without creating AppKit objects on a worker.
     pub(crate) fn is_main_queue_serviceable() -> bool {
         let d = &*DISPATCH;
         unsafe {
-            let cls = (d.objc_get_class)(c"NSApplication".as_ptr().cast());
-            if cls.is_null() {
+            let mode = (d.cf_run_loop_copy_current_mode)((d.cf_run_loop_get_main)());
+            if mode.is_null() {
                 return false;
             }
-            let shared_sel = (d.sel_register_name)(c"sharedApplication".as_ptr().cast());
-            let send: MsgSendId0 = std::mem::transmute(d.msg_send);
-            let app = send(cls, shared_sel);
-            if app.is_null() {
-                return false;
-            }
-            let running_sel = (d.sel_register_name)(c"isRunning".as_ptr().cast());
-            type MsgSendBool = unsafe extern "C" fn(Id, Sel) -> u8;
-            let send_bool: MsgSendBool = std::mem::transmute(d.msg_send);
-            send_bool(app, running_sel) != 0
+            (d.cf_release)(mode.cast_mut());
+            true
+        }
+    }
+
+    pub(crate) fn can_dispatch() -> bool {
+        (unsafe { (DISPATCH.pthread_main_np)() != 0 }) || is_main_queue_serviceable()
+    }
+
+    fn run_on_main_async<F: FnOnce() + Send + 'static>(f: F) {
+        unsafe extern "C" fn invoke<F: FnOnce()>(context: *mut c_void) {
+            let callback = unsafe { Box::from_raw(context as *mut F) };
+            callback();
+        }
+        let context = Box::into_raw(Box::new(f)).cast();
+        unsafe {
+            (DISPATCH.dispatch_async)(DISPATCH.main_queue, context, invoke::<F>);
         }
     }
 
@@ -2529,9 +2181,8 @@ mod cocoa {
     /// internally call `dispatch_sync(dispatch_get_main_queue(), ...)` won't
     /// deadlock.
     ///
-    /// Falls back to direct execution if:
-    /// - Already on the main thread (avoids deadlock)
-    /// - No NSApplication is running (test/CLI context — run loop not serviced)
+    /// Executes directly only on the main thread. Worker calls require a
+    /// running main event loop; otherwise panic before invoking the closure.
     pub(crate) fn run_on_main_sync<F, R>(f: F) -> R
     where
         F: FnOnce() -> R + Send,
@@ -2542,12 +2193,10 @@ mod cocoa {
             return f();
         }
 
-        // If no NSApplication is running (test process, CLI tool), the main
-        // run loop is never serviced and the source would never fire.
-        if !is_main_queue_serviceable() {
-            tracing::debug!("no NSApplication running — executing on current thread");
-            return f();
-        }
+        assert!(
+            is_main_queue_serviceable(),
+            "main event loop unavailable: call on the main thread or start its event loop"
+        );
 
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -2666,6 +2315,7 @@ mod cocoa {
         window: Id,
         /// Dedicated child NSView for IPlugView::attached(). Not the contentView.
         plugin_view: Id,
+        delegate: Id,
     }
 
     // Safety: CocoaWindow is only used from one thread at a time.
@@ -2775,6 +2425,14 @@ mod cocoa {
                     return Err("NSWindow init failed".into());
                 }
 
+                let mut owned = Self {
+                    objc,
+                    window,
+                    plugin_view: std::ptr::null_mut(),
+                    delegate: std::ptr::null_mut(),
+                };
+
+                let objc = &owned.objc;
                 // [window setReleasedWhenClosed:NO]
                 let set_released: MsgSendBool1 = std::mem::transmute(objc.msg_send);
                 set_released(window, set_released_sel, 0);
@@ -2839,6 +2497,7 @@ mod cocoa {
                 if plugin_view.is_null() {
                     return Err("NSView initWithFrame failed".into());
                 }
+                owned.plugin_view = plugin_view;
                 // Layer-back the plugin view too
                 set_wants_layer(plugin_view, wants_layer_sel, 1);
                 // [contentView addSubview:pluginView]
@@ -2864,6 +2523,7 @@ mod cocoa {
                             let init_delegate: MsgSendId0 = std::mem::transmute(objc.msg_send);
                             let delegate = init_delegate(delegate, delegate_init_sel);
                             if !delegate.is_null() {
+                                owned.delegate = delegate;
                                 // [window setDelegate:delegate]
                                 let set_delegate_sel = objc.sel(b"setDelegate:\0");
                                 let set_delegate: MsgSendVoid1 = std::mem::transmute(objc.msg_send);
@@ -2883,11 +2543,7 @@ mod cocoa {
 
                 tracing::debug!(width, height, "macOS NSWindow created for VST3 editor");
 
-                Ok(Self {
-                    objc,
-                    window,
-                    plugin_view,
-                })
+                Ok(owned)
             }
         }
 
@@ -3019,38 +2675,44 @@ mod cocoa {
     impl Drop for CocoaWindow {
         fn drop(&mut self) {
             let window_addr = self.window as usize;
-
-            // Clean up any stale close callback (programmatic close path)
             if let Ok(mut map) = WINDOW_CLOSE_CALLBACKS.lock() {
                 map.remove(&window_addr);
             }
-
-            // If the window was closed externally (user clicked red X), the
-            // NSWindow is already closing — skip [window close] to avoid reentrancy.
-            if EXTERNALLY_CLOSED
+            let external = EXTERNALLY_CLOSED
                 .lock()
-                .is_ok_and(|mut set| set.remove(&window_addr))
-            {
-                tracing::debug!("skipping [window close] — window already closed by user");
-                return;
-            }
-
-            // Normal programmatic close path.
-            // Cast raw pointers to usize so the closure is Send.
-            // Safety: these pointers are valid for the lifetime of CocoaWindow and are
-            // only accessed on the main thread inside the closure.
+                .is_ok_and(|mut set| set.remove(&window_addr));
+            let view_addr = self.plugin_view as usize;
+            let delegate_addr = self.delegate as usize;
+            // Objective-C selectors and libobjc entry points are process-resident.
             let msg_send_addr = self.objc.msg_send as usize;
-            let close_sel_addr = self.objc.sel(b"close\0") as usize;
-
-            run_on_main_sync(move || unsafe {
+            let delegate_sel = self.objc.sel(b"setDelegate:\0") as usize;
+            let close_sel = self.objc.sel(b"close\0") as usize;
+            let release_sel = self.objc.sel(b"release\0") as usize;
+            let cleanup = move || unsafe {
                 let window = window_addr as Id;
-                let close_sel = close_sel_addr as Sel;
-                let msg_send = msg_send_addr as *const c_void;
-                let close: MsgSendVoid0 = std::mem::transmute(msg_send);
-                close(window, close_sel);
-            });
-
-            tracing::debug!("macOS NSWindow closed for VST3 editor");
+                let set_delegate: MsgSendVoid1 =
+                    std::mem::transmute(msg_send_addr as *const c_void);
+                let send: MsgSendVoid0 = std::mem::transmute(msg_send_addr as *const c_void);
+                set_delegate(window, delegate_sel as Sel, std::ptr::null_mut());
+                if !external {
+                    send(window, close_sel as Sel);
+                }
+                if delegate_addr != 0 {
+                    send(delegate_addr as Id, release_sel as Sel);
+                }
+                if view_addr != 0 {
+                    send(view_addr as Id, release_sel as Sel);
+                }
+                send(window, release_sel as Sel);
+            };
+            if external {
+                // The delegate callback still has window/delegate on its stack.
+                // Dispatch asynchronously to release only after it returns.
+                run_on_main_async(cleanup);
+            } else {
+                run_on_main_sync(cleanup);
+            }
+            tracing::debug!("macOS editor native ownership released");
         }
     }
 }
@@ -3081,7 +2743,19 @@ impl EditorView {
     /// The instance must be initialized (at least `initialize()` called).
     /// Reuses the instance's existing IEditController to avoid duplicate
     /// controllers and ensure correct setComponentHandler/IConnectionPoint wiring.
-    pub fn from_instance(instance: &crate::VstInstance) -> Result<Self, Vst3Error> {
+    /// # Safety
+    /// The instance must remain alive and initialized until the returned editor
+    /// is closed and dropped. Do not terminate it while the editor exists.
+    /// Serialize controller/editor operations on the native UI thread; mutable
+    /// audio processing may continue on its designated processing thread.
+    pub unsafe fn from_instance(instance: &crate::VstInstance) -> Result<Self, Vst3Error> {
+        instance.ensure_editor_ready()?;
+        #[cfg(target_os = "macos")]
+        if !cocoa::can_dispatch() {
+            return Err(Vst3Error::InitFailed(
+                "main-thread UI loop unavailable".into(),
+            ));
+        }
         unsafe {
             Self::create(
                 instance.component_ptr(),
@@ -3103,6 +2777,24 @@ impl EditorView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn worker_without_main_loop_rejects_dispatch_before_invoking_closure() {
+        use std::sync::atomic::AtomicBool;
+        let called = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                std::panic::catch_unwind(|| {
+                    cocoa::run_on_main_sync(|| {
+                        called.store(true, Ordering::Relaxed);
+                    });
+                })
+            });
+            assert!(worker.join().unwrap().is_err());
+        });
+        assert!(!called.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn view_rect_dimensions() {

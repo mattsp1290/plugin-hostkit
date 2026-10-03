@@ -3,15 +3,14 @@
 //! These types mirror the VST3 SDK C++ structs with `#[repr(C)]` to ensure
 //! binary-compatible layouts for FFI calls.
 
-use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::os::raw::c_void;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicI32, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
 // ── Host callback ring buffer (freeze diagnostics) ─────────────────
 //
-// Lock-free ring buffer that records every host COM callback with a
+// Bounded nonblocking ring that records host COM callbacks with a
 // timestamp. Survives main-thread freezes because entries are written
 // from whatever thread the callback fires on and can be read from the
 // watchdog background thread.
@@ -48,14 +47,11 @@ pub struct HostCbEntry {
 const RING_LEN: usize = 128;
 static RING_HEAD: AtomicUsize = AtomicUsize::new(0);
 
-// SAFETY: Slots are claimed atomically via RING_HEAD. Each writer has exclusive
-// access to its slot. The per-slot `ready` flag (Release/Acquire) ensures the
-// reader in dump_callback_ring only reads fully-written entries.
+// Both readers and writers use nonblocking ownership of each slot. Busy
+// entries are skipped: diagnostics must not delay callbacks or the watchdog.
 struct RingSlot {
-    data: UnsafeCell<HostCbEntry>,
-    ready: AtomicU8, // 0 = empty/being written, 1 = ready to read
+    data: Mutex<HostCbEntry>,
 }
-unsafe impl Sync for RingSlot {}
 
 const EMPTY_ENTRY: HostCbEntry = HostCbEntry {
     mono_ns: 0,
@@ -66,8 +62,7 @@ const EMPTY_ENTRY: HostCbEntry = HostCbEntry {
 };
 #[allow(clippy::declare_interior_mutable_const)] // Repeated initializer creates distinct atomics.
 const EMPTY_SLOT: RingSlot = RingSlot {
-    data: UnsafeCell::new(EMPTY_ENTRY),
-    ready: AtomicU8::new(0),
+    data: Mutex::new(EMPTY_ENTRY),
 };
 
 static RING: [RingSlot; RING_LEN] = [EMPTY_SLOT; RING_LEN];
@@ -94,8 +89,6 @@ fn mono_ns() -> u64 {
 fn ring_push(kind: HostCbKind, param_id: u32, extra: u64) {
     let idx = RING_HEAD.fetch_add(1, Ordering::Relaxed) % RING_LEN;
     let slot = &RING[idx];
-    // Mark slot as being written (clears any previous ready flag).
-    slot.ready.store(0, Ordering::Relaxed);
     let entry = HostCbEntry {
         mono_ns: mono_ns(),
         kind,
@@ -103,12 +96,9 @@ fn ring_push(kind: HostCbKind, param_id: u32, extra: u64) {
         param_id,
         extra,
     };
-    // SAFETY: each slot is claimed by exactly one writer at a time (atomic index).
-    unsafe {
-        slot.data.get().write(entry);
+    if let Ok(mut data) = slot.data.try_lock() {
+        *data = entry;
     }
-    // Release ensures the entry is fully written before the reader sees ready=1.
-    slot.ready.store(1, Ordering::Release);
 }
 
 /// Dump the last RING_LEN host callback entries as a human-readable string.
@@ -120,11 +110,10 @@ pub fn dump_callback_ring() -> String {
     let mut prev_ns: u64 = 0;
     for i in start..head {
         let slot = &RING[i % RING_LEN];
-        // Acquire ensures we see the fully-written entry after the writer's Release.
-        if slot.ready.load(Ordering::Acquire) == 0 {
-            continue;
-        }
-        let entry = unsafe { slot.data.get().read() };
+        let entry = match slot.data.try_lock() {
+            Ok(data) => *data,
+            Err(_) => continue,
+        };
         if entry.mono_ns == 0 {
             continue;
         }
@@ -1079,21 +1068,51 @@ struct ITimerHandlerVtbl {
 
 // ── Unified host context object ─────────────────────────────────────
 
-/// Registered fd watch or timer for Linux IRunLoop.
+/// Owns one plugin COM reference; Arc snapshots extend registration lifetime
+/// without calling foreign addRef/release under the registry mutex.
 #[cfg(target_os = "linux")]
-struct RunLoopState {
-    /// (file_descriptor, IEventHandler*) — plugin-registered fd watches.
-    event_handlers: Vec<(i32, *mut c_void)>,
-    /// (interval_ms, ITimerHandler*, last_fired) — plugin-registered timers.
-    timers: Vec<(u64, *mut c_void, std::time::Instant)>,
+struct RetainedHandler {
+    ptr: *mut c_void,
 }
 
-// SAFETY: RunLoopState stores raw pointers from the plugin's COM objects.
-// These pointers are only dereferenced on the same thread that calls
-// service_run_loop(), which is the editor event loop thread. The Mutex
-// ensures no data races on the Vec metadata itself.
 #[cfg(target_os = "linux")]
-unsafe impl Send for RunLoopState {}
+impl RetainedHandler {
+    unsafe fn retain(ptr: *mut c_void) -> Option<std::sync::Arc<Self>> {
+        if ptr.is_null() {
+            return None;
+        }
+        let vtbl = unsafe { *(ptr as *const *const FUnknownVtbl) };
+        unsafe {
+            ((*vtbl).add_ref)(ptr);
+        }
+        Some(std::sync::Arc::new(Self { ptr }))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for RetainedHandler {
+    fn drop(&mut self) {
+        unsafe {
+            let vtbl = *(self.ptr as *const *const FUnknownVtbl);
+            ((*vtbl).release)(self.ptr);
+        }
+    }
+}
+
+// SAFETY: shared ownership only extends the COM reference lifetime. Callbacks
+// remain confined to the caller's serialized UI event loop; COM refcounts must
+// support registration/unregistration on the threads permitted by the SDK.
+#[cfg(target_os = "linux")]
+unsafe impl Send for RetainedHandler {}
+#[cfg(target_os = "linux")]
+unsafe impl Sync for RetainedHandler {}
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct RunLoopState {
+    event_handlers: Vec<(i32, std::sync::Arc<RetainedHandler>)>,
+    timers: Vec<(u64, std::sync::Arc<RetainedHandler>, std::time::Instant)>,
+}
 
 /// Unified host context implementing IHostApplication, IPlugInterfaceSupport,
 /// IComponentHandler, IComponentHandler2, IUnitHandler, and (on Linux)
@@ -1709,17 +1728,17 @@ unsafe extern "C" fn rl_register_event_handler(
         );
         let base = (this as *const u8).sub(std::mem::offset_of!(HostContextObj, rl_vtable))
             as *const HostContextObj;
+        let Some(owned) = RetainedHandler::retain(handler) else {
+            return K_RESULT_FALSE;
+        };
         let registered = match (*base).run_loop_state.lock() {
             Ok(mut state) => {
-                state.event_handlers.push((fd, handler));
+                state.event_handlers.push((fd, owned));
                 true
             }
             Err(_) => false,
         };
-        // addRef outside lock — plugin's addRef may have side effects.
         if registered {
-            let vtbl = *(handler as *const *const FUnknownVtbl);
-            ((*vtbl).add_ref)(handler);
             K_RESULT_OK
         } else {
             K_RESULT_FALSE
@@ -1743,15 +1762,12 @@ unsafe extern "C" fn rl_unregister_event_handler(
             Ok(mut state) => state
                 .event_handlers
                 .iter()
-                .position(|&(_, h)| h == handler)
+                .position(|(_, h)| h.ptr == handler)
                 .map(|pos| state.event_handlers.remove(pos).1),
             Err(_) => return K_RESULT_FALSE,
         };
         // release outside lock — plugin's release may have side effects.
-        if let Some(removed_handler) = removed {
-            let vtbl = *(removed_handler as *const *const FUnknownVtbl);
-            ((*vtbl).release)(removed_handler);
-        }
+        drop(removed);
         K_RESULT_OK
     }
 }
@@ -1770,19 +1786,19 @@ unsafe extern "C" fn rl_register_timer(
         );
         let base = (this as *const u8).sub(std::mem::offset_of!(HostContextObj, rl_vtable))
             as *const HostContextObj;
+        let Some(owned) = RetainedHandler::retain(handler) else {
+            return K_RESULT_FALSE;
+        };
         let registered = match (*base).run_loop_state.lock() {
             Ok(mut state) => {
                 state
                     .timers
-                    .push((milliseconds, handler, std::time::Instant::now()));
+                    .push((milliseconds, owned, std::time::Instant::now()));
                 true
             }
             Err(_) => false,
         };
-        // addRef outside lock — plugin's addRef may have side effects.
         if registered {
-            let vtbl = *(handler as *const *const FUnknownVtbl);
-            ((*vtbl).add_ref)(handler);
             K_RESULT_OK
         } else {
             K_RESULT_FALSE
@@ -1803,15 +1819,12 @@ unsafe extern "C" fn rl_unregister_timer(this: *mut c_void, handler: *mut c_void
             Ok(mut state) => state
                 .timers
                 .iter()
-                .position(|&(_, h, _)| h == handler)
+                .position(|(_, h, _)| h.ptr == handler)
                 .map(|pos| state.timers.remove(pos).1),
             Err(_) => return K_RESULT_FALSE,
         };
         // release outside lock — plugin's release may have side effects.
-        if let Some(removed_handler) = removed {
-            let vtbl = *(removed_handler as *const *const FUnknownVtbl);
-            ((*vtbl).release)(removed_handler);
-        }
+        drop(removed);
         K_RESULT_OK
     }
 }
@@ -1839,6 +1852,19 @@ impl HostContextObj {
                 timers: Vec::new(),
             }),
         }
+    }
+
+    /// Release registrations outside the mutex, before the module is unloaded.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn clear_run_loop(&self) {
+        let old = {
+            let mut state = self
+                .run_loop_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *state)
+        };
+        drop(old);
     }
 
     /// Drain parameter changes queued by `performEdit` callbacks.
@@ -1879,13 +1905,14 @@ impl HostContextObj {
     /// `on_fd_is_set` or `on_timer` callbacks.
     ///
     /// # Safety
-    /// The registered IEventHandler/ITimerHandler pointers must still be valid.
-    /// This is guaranteed as long as the plugin hasn't been unloaded.
+    /// The plugin module and host context must remain alive during this call.
+    /// Callbacks must run on the plugin's UI thread, with no concurrent service
+    /// or termination. Owned snapshots keep handlers alive across unregistration.
     #[cfg(target_os = "linux")]
     pub unsafe fn service_run_loop(&self) {
         unsafe {
             // Snapshot event handlers while holding lock, then release before callbacks.
-            let handlers: Vec<(i32, *mut c_void)> = {
+            let handlers = {
                 let state = match self.run_loop_state.lock() {
                     Ok(s) => s,
                     Err(poisoned) => poisoned.into_inner(),
@@ -1897,8 +1924,8 @@ impl HostContextObj {
             if !handlers.is_empty() {
                 let mut pollfds: Vec<libc::pollfd> = handlers
                     .iter()
-                    .map(|&(fd, _)| libc::pollfd {
-                        fd,
+                    .map(|(fd, _)| libc::pollfd {
+                        fd: *fd,
                         events: libc::POLLIN | libc::POLLPRI,
                         revents: 0,
                     })
@@ -1916,7 +1943,7 @@ impl HostContextObj {
                                     "IRunLoop: fd error condition"
                                 );
                             }
-                            let handler = handlers[i].1;
+                            let handler = handlers[i].1.ptr;
                             let vtbl = *(handler as *const *const IEventHandlerVtbl);
                             ((*vtbl).on_fd_is_set)(handler, pfd.fd);
                         }
@@ -1925,7 +1952,7 @@ impl HostContextObj {
             }
 
             // Snapshot timers while holding lock.
-            let timer_snapshot: Vec<(u64, *mut c_void, std::time::Instant)> = {
+            let timer_snapshot = {
                 let state = match self.run_loop_state.lock() {
                     Ok(s) => s,
                     Err(poisoned) => poisoned.into_inner(),
@@ -1936,8 +1963,10 @@ impl HostContextObj {
             // Fire due timers (lock not held — plugin may re-enter register/unregister).
             let now = std::time::Instant::now();
             let mut fired: Vec<(usize, std::time::Instant)> = Vec::new();
-            for (i, &(interval_ms, handler, last_fired)) in timer_snapshot.iter().enumerate() {
-                if now.duration_since(last_fired) >= std::time::Duration::from_millis(interval_ms) {
+            for (i, (interval_ms, owned, last_fired)) in timer_snapshot.iter().enumerate() {
+                let handler = owned.ptr;
+                if now.duration_since(*last_fired) >= std::time::Duration::from_millis(*interval_ms)
+                {
                     fired.push((i, now));
                     let vtbl = *(handler as *const *const ITimerHandlerVtbl);
                     ((*vtbl).on_timer)(handler);
@@ -1950,8 +1979,12 @@ impl HostContextObj {
                 && let Ok(mut state) = self.run_loop_state.lock()
             {
                 for (snapshot_idx, fired_at) in &fired {
-                    let fired_handler = timer_snapshot[*snapshot_idx].1;
-                    if let Some(entry) = state.timers.iter_mut().find(|e| e.1 == fired_handler) {
+                    let fired_handler = &timer_snapshot[*snapshot_idx].1;
+                    if let Some(entry) = state
+                        .timers
+                        .iter_mut()
+                        .find(|e| std::sync::Arc::ptr_eq(&e.1, fired_handler))
+                    {
                         entry.2 = *fired_at;
                     }
                 }
@@ -2828,6 +2861,104 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn timer_snapshots_own_handlers_through_reentrant_unregistration() {
+        use std::sync::atomic::AtomicUsize;
+        #[repr(C)]
+        struct Timer {
+            vtable: *const ITimerHandlerVtbl,
+            refs: AtomicUsize,
+            loop_ptr: *mut c_void,
+            target: *mut c_void,
+            calls: *const AtomicUsize,
+            freed: *const AtomicUsize,
+        }
+        unsafe extern "C" fn qi(_: *mut c_void, _: *const TUID, _: *mut *mut c_void) -> TResult {
+            K_NO_INTERFACE
+        }
+        unsafe extern "C" fn retain(this: *mut c_void) -> u32 {
+            unsafe { (*(this as *mut Timer)).refs.fetch_add(1, Ordering::Relaxed) as u32 + 1 }
+        }
+        unsafe extern "C" fn release(this: *mut c_void) -> u32 {
+            unsafe {
+                let timer = &*(this as *mut Timer);
+                let remaining = timer.refs.fetch_sub(1, Ordering::AcqRel) - 1;
+                if remaining == 0 {
+                    (*timer.freed).fetch_add(1, Ordering::Relaxed);
+                    drop(Box::from_raw(this as *mut Timer));
+                }
+                remaining as u32
+            }
+        }
+        unsafe extern "C" fn fire(this: *mut c_void) {
+            unsafe {
+                let timer = &*(this as *mut Timer);
+                (*timer.calls).fetch_add(1, Ordering::Relaxed);
+                if !timer.target.is_null() {
+                    rl_unregister_timer(timer.loop_ptr, timer.target);
+                    release(timer.target); // plugin's own reference to B
+                    rl_unregister_timer(timer.loop_ptr, this);
+                    release(this); // plugin's own reference to A
+                }
+            }
+        }
+        static VTABLE: ITimerHandlerVtbl = ITimerHandlerVtbl {
+            _query_interface: qi,
+            _add_ref: retain,
+            _release: release,
+            on_timer: fire,
+        };
+        let calls = AtomicUsize::new(0);
+        let freed = AtomicUsize::new(0);
+        let mut context = HostContextObj::new();
+        let loop_ptr = std::ptr::addr_of_mut!(context.rl_vtable).cast();
+        let timer = |target| {
+            Box::into_raw(Box::new(Timer {
+                vtable: &VTABLE,
+                refs: AtomicUsize::new(1),
+                loop_ptr,
+                target,
+                calls: &calls,
+                freed: &freed,
+            }))
+            .cast()
+        };
+        let b = timer(std::ptr::null_mut());
+        let a = timer(b);
+        unsafe {
+            assert_eq!(rl_register_timer(loop_ptr, a, 0), K_RESULT_OK);
+            assert_eq!(rl_register_timer(loop_ptr, b, 0), K_RESULT_OK);
+            context.service_run_loop();
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(freed.load(Ordering::Relaxed), 2);
+        assert!(context.run_loop_state.lock().unwrap().timers.is_empty());
+        context.clear_run_loop();
+    }
+
+    #[test]
+    fn callback_ring_supports_concurrent_wraparound_and_nonblocking_reads() {
+        std::thread::scope(|scope| {
+            for producer in 0..4 {
+                scope.spawn(move || {
+                    for n in 0..2048 {
+                        ring_push(HostCbKind::PerformEdit, producer, n);
+                    }
+                });
+            }
+            scope.spawn(|| {
+                for _ in 0..128 {
+                    let _ = dump_callback_ring();
+                }
+            });
+        });
+        assert!(dump_callback_ring().contains("PerformEdit"));
+        let _held = RING[0].data.lock().unwrap();
+        // A dump must skip a busy slot rather than wait for its writer.
+        let _ = dump_callback_ring();
+    }
 
     #[test]
     fn event_list_basic_operations() {

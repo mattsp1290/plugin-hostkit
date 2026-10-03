@@ -5,28 +5,6 @@ use common::create_fake_preset;
 use plugin_hostkit::preset::PresetManager;
 
 #[test]
-fn scan_finds_preset_files() {
-    let tmp = tempfile::tempdir().unwrap();
-    let preset_dir = tmp.path().join("presets");
-
-    create_fake_preset(&preset_dir, "Pad");
-    create_fake_preset(&preset_dir, "Bass");
-    create_fake_preset(&preset_dir, "Lead");
-
-    // Also create a non-preset file that should be ignored
-    std::fs::write(preset_dir.join("readme.txt"), b"not a preset").unwrap();
-
-    // Verify files were created correctly
-    let entries: Vec<_> = std::fs::read_dir(&preset_dir)
-        .unwrap()
-        .flatten()
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "vstpreset"))
-        .collect();
-
-    assert_eq!(entries.len(), 3);
-}
-
-#[test]
 fn load_preset_via_manager() {
     let tmp = tempfile::tempdir().unwrap();
     let preset_path = create_fake_preset(tmp.path(), "TestPreset");

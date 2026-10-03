@@ -35,7 +35,7 @@ The scanner launches a helper for factory metadata rather than loading unknown
 plugins in the caller. A failing or timed-out helper adds its binary path to
 the persistent blacklist. Explicit option setters must run before first use.
 Rendering remains in-process unless the application supplies process isolation.
-Signal guards can leave foreign state inconsistent and are not a recovery
+Native faults are process-fatal. In-process signal jumps are not a recovery
 boundary suitable for keeping a production process alive after memory faults.
 
 ## Presets and processing

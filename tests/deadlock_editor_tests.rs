@@ -149,7 +149,9 @@ fn load_ad2_instance() -> Option<VstInstance> {
 fn test_editor_open_no_deadlock(instance: &VstInstance) -> bool {
     eprintln!("test: ad2_editor_open_no_deadlock");
 
-    let mut view = match EditorView::from_instance(instance) {
+    // SAFETY: the harness keeps this initialized instance alive until view teardown,
+    // and runs native operations on the process main thread.
+    let mut view = match unsafe { EditorView::from_instance(instance) } {
         Ok(v) => v,
         Err(e) => {
             eprintln!("FAIL: EditorView not available for installed Addictive Drums 2: {e}");
@@ -192,7 +194,9 @@ fn test_editor_open_no_deadlock(instance: &VstInstance) -> bool {
 fn test_editor_view_created(instance: &VstInstance) -> bool {
     eprintln!("test: ad2_editor_view_created");
 
-    let view = match EditorView::from_instance(instance) {
+    // SAFETY: the harness keeps this initialized instance alive until view teardown,
+    // and runs native operations on the process main thread.
+    let view = match unsafe { EditorView::from_instance(instance) } {
         Ok(v) => v,
         Err(e) => {
             eprintln!("FAIL: EditorView not available for installed Addictive Drums 2: {e}");
@@ -216,7 +220,9 @@ fn test_editor_view_created(instance: &VstInstance) -> bool {
 fn test_editor_close_is_idempotent(instance: &VstInstance) -> bool {
     eprintln!("test: ad2_editor_close_is_idempotent");
 
-    let mut view = match EditorView::from_instance(instance) {
+    // SAFETY: the harness keeps this initialized instance alive until view teardown,
+    // and runs native operations on the process main thread.
+    let mut view = match unsafe { EditorView::from_instance(instance) } {
         Ok(v) => v,
         Err(e) => {
             eprintln!("FAIL: EditorView not available for installed Addictive Drums 2: {e}");

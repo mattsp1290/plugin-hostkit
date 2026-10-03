@@ -1,8 +1,8 @@
-//! Integration tests for SIGSEGV guard behavior in VstInstance lifecycle.
+//! Integration tests for signal-handler preservation in VstInstance lifecycle.
 //!
 //! Uses `harness = false` so `main()` runs on the process's main thread.
-//! Tests that exercise real guard behavior run in subprocesses to isolate
-//! any heap corruption that siglongjmp recovery may cause.
+//! Native lifecycle tests run in subprocesses so plugin faults cannot kill
+//! the parent harness. Hostkit does not install signal-recovery handlers.
 //!
 //! Run with: `cargo test -p plugin-hostkit --test sigsegv_guard_tests`
 
@@ -35,10 +35,10 @@ fn load_vital_instance() -> Result<VstInstance, String> {
 // ── Subprocess entry points ──────────────────────────────────────────
 
 /// Test A (subprocess): load + initialize + setup_processing + activate Vital.
-/// Verifies the full lifecycle works without the guards interfering.
+/// Verifies the normal lifecycle in a disposable child.
 fn run_vital_normal_lifecycle() -> ExitCode {
     eprintln!("  [subprocess] loading Vital...");
-    let instance = match load_vital_instance() {
+    let mut instance = match load_vital_instance() {
         Ok(i) => i,
         Err(e) => {
             eprintln!("  FAIL: {e}");
@@ -46,17 +46,17 @@ fn run_vital_normal_lifecycle() -> ExitCode {
         }
     };
     eprintln!("  load + initialize + setup_processing + activate OK");
-    std::mem::forget(instance);
+    instance.terminate().expect("terminate Vital");
     ExitCode::SUCCESS
 }
 
 /// Test B (subprocess): install a custom SIGSEGV handler, load Vital
-/// (exercises guarded_create_instance + guarded_initialize_component +
-/// guarded_set_component_state), then verify the custom handler is
+/// (exercises direct factory calls + direct initialization +
+/// direct state synchronization), then verify the custom handler is
 /// still installed afterward.
 ///
-/// This confirms that every guard restores the previous signal action
-/// after it completes (normal path and crash path).
+/// This confirms that the lifecycle preserves the previous signal action
+/// after successful initialization and termination.
 #[cfg(unix)]
 fn run_vital_handler_restoration() -> ExitCode {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -84,15 +84,15 @@ fn run_vital_handler_restoration() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Load Vital — exercises all three guarded functions:
-    //   VstInstance::load     → guarded_create_instance
-    //   instance.initialize() → guarded_initialize_component
-    //                         → guarded_set_component_state (inside init_edit_controller)
-    eprintln!("  [subprocess] loading Vital (exercises all three guards)...");
+    // Load Vital through the ordinary factory/component lifecycle:
+    //   VstInstance::load     → direct factory calls
+    //   instance.initialize() → direct initialization
+    //                         → direct state synchronization (inside init_edit_controller)
+    eprintln!("  [subprocess] loading Vital (exercises lifecycle)...");
     match load_vital_instance() {
-        Ok(instance) => {
+        Ok(mut instance) => {
             eprintln!("  load + initialize + setup_processing + activate OK");
-            std::mem::forget(instance);
+            instance.terminate().expect("terminate Vital");
         }
         Err(e) => {
             eprintln!("  FAIL: could not load Vital: {e}");
@@ -116,7 +116,7 @@ fn run_vital_handler_restoration() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    eprintln!("  custom SIGSEGV handler still installed after all guards ran — PASS");
+    eprintln!("  custom SIGSEGV handler still installed after lifecycle completed — PASS");
     ExitCode::SUCCESS
 }
 
@@ -126,10 +126,10 @@ fn run_vital_handler_restoration() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-// ── Test A: Normal lifecycle with guards ─────────────────────────────
+// ── Test A: Normal lifecycle in a child ─────────────────────────────
 
 fn test_vital_normal_lifecycle() -> bool {
-    eprintln!("test: vital_normal_lifecycle_with_guards");
+    eprintln!("test: vital_normal_lifecycle_in_child");
 
     let exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -178,7 +178,7 @@ fn test_vital_normal_lifecycle() -> bool {
 // ── Test B: SIGSEGV handler restoration ──────────────────────────────
 
 fn test_vital_handler_restoration() -> bool {
-    eprintln!("test: vital_sigsegv_handler_restored_after_guards");
+    eprintln!("test: vital_sigsegv_handler_restored_after_lifecycle");
 
     let exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -262,24 +262,23 @@ fn main() -> ExitCode {
 
     let mut failures = 0;
 
-    // Test A: normal lifecycle doesn't break when guards are active.
+    // Test A: normal lifecycle works in a child process.
     if vital_ok {
         if !test_vital_normal_lifecycle() {
             failures += 1;
         }
     } else {
-        eprintln!("SKIPPED: vital_normal_lifecycle_with_guards (Vital not installed)");
+        eprintln!("SKIPPED: vital_normal_lifecycle_in_child (Vital not installed)");
     }
 
-    // Test B: each guard restores the previously-installed signal handler.
-    // This is the most important correctness property of the guards — they
-    // must not permanently replace whatever handler the caller had installed.
+    // Test B: each lifecycle preserves the previously-installed signal handler.
+    // Hostkit leaves the caller's signal disposition untouched.
     if vital_ok {
         if !test_vital_handler_restoration() {
             failures += 1;
         }
     } else {
-        eprintln!("SKIPPED: vital_sigsegv_handler_restored_after_guards (Vital not installed)");
+        eprintln!("SKIPPED: vital_sigsegv_handler_restored_after_lifecycle (Vital not installed)");
     }
 
     eprintln!("\n{failures} failure(s)");

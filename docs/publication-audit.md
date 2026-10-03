@@ -383,3 +383,50 @@ and absence of skip lines, and runs the load example. It runs on pushes,
 pull requests and manual dispatch, including release tags. CI is still a
 publication checkpoint to verify on the exact release commit; local container
 evidence is not described as remote CI success.
+
+## Committed path-history verification
+
+`git log --all --name-only --format=` passed the prohibited-path check after
+the local implementation commit. Its unique nonempty output paths are:
+
+```text
+.github/workflows/ci.yml
+.github/workflows/integration.yml
+.gitignore
+Cargo.lock
+Cargo.toml
+LICENSE
+README.md
+THIRD-PARTY-NOTICES.md
+assets/compatible-logo.png
+docs/hosting-notes.md
+docs/publication-audit.md
+examples/custom_scanner.rs
+examples/load.rs
+examples/scan.rs
+src/bin/plugin_scanner.rs
+src/cli.rs
+src/com.rs
+src/discovery.rs
+src/editor.rs
+src/error.rs
+src/factory.rs
+src/host.rs
+src/instance.rs
+src/lib.rs
+src/preset.rs
+src/scanner.rs
+src/watchdog.rs
+tests/common/mod.rs
+tests/deadlock_editor_tests.rs
+tests/discovery_preset_tests.rs
+tests/discovery_tests.rs
+tests/fixture_plugin_tests.rs
+tests/preset_tests.rs
+tests/scanner_cli_tests.rs
+tests/scanner_options_tests.rs
+tests/sigsegv_guard_tests.rs
+tests/vital_editor_tests.rs
+tests/vital_integration_tests.rs
+tools/verify_sdk_abi.py
+```
